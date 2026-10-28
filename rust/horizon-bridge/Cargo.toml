@@ -1,0 +1,18 @@
+[workspace]
+members = ["client", "server", "tools"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+sbw-contract = { path = "../crates/sbw-contract" }
+# Development adapter: the patched Horizon checkout is a sibling of this repo.
+horizon-mod-sdk = { path = "../../../horizon/crates/horizon-mod-sdk" }
+horizon-mods = { path = "../../../horizon/crates/horizon-mods", default-features = false, features = ["pack"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"

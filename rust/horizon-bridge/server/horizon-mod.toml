@@ -1,0 +1,7 @@
+id = "superbwarfare"
+name = "SuperbWarfare transport probe (server)"
+version = "0.1.0"
+api = "0.3"
+side = "server"
+capabilities = ["net", "players"]
+experimental = ["net"]

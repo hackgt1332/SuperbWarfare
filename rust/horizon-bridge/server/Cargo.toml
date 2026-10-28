@@ -1,0 +1,16 @@
+[package]
+name = "sbw-horizon-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sbw-contract.workspace = true
+horizon-mod-sdk.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,1710 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index f048c88d2..8e57d7b33 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1504,6 +1504,7 @@ dependencies = [
+ name = "horizon-mods"
+ version = "0.1.0"
+ dependencies = [
++ "getrandom 0.2.17",
+  "horizon-shader-api",
+  "log",
+  "minisign-verify",
+diff --git a/crates/cargo-horizon-mod/src/check.rs b/crates/cargo-horizon-mod/src/check.rs
+index 988ba826d..3413ce77e 100644
+--- a/crates/cargo-horizon-mod/src/check.rs
++++ b/crates/cargo-horizon-mod/src/check.rs
+@@ -265,6 +265,7 @@ fn play(path: &Path, report: &mut Report) -> Result<(), String> {
+             Output::QuietCommands { lines, .. } => {
+                 format!("{} quiet command(s)", lines.len())
+             }
++            Output::Network { data, .. } => format!("queued {} network byte(s)", data.len()),
+             Output::Stopped { reason, .. } => return Err(format!("it stopped: {reason}")),
+             Output::SetBlocks {
+                 dimension, blocks, ..
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index c97af3a47..0e0127765 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -112,6 +112,7 @@ mod mod_browser;
+ #[cfg(feature = "mods")]
+ mod mod_browser_recipes;
+ mod mod_input;
++mod mod_network;
+ #[cfg(feature = "mods")]
+ mod mod_recipes;
+ mod mod_render;
+@@ -9358,6 +9359,13 @@ impl Game<'_> {
+         Ok(())
+     }
+     fn close_world(&mut self) -> Result<()> {
++        #[cfg(feature = "mods")]
++        {
++            self.mods
++                .mods
++                .network_peer_left(&self.player_uuid_string(), 0);
++            self.mods.mods.network_disconnected();
++        }
+         self.clear_waypoints();
+         self.begin_closing_save(false)
+     }
+diff --git a/crates/horizon-client/src/game/lan.rs b/crates/horizon-client/src/game/lan.rs
+index 83fdaf4be..b8f5889af 100644
+--- a/crates/horizon-client/src/game/lan.rs
++++ b/crates/horizon-client/src/game/lan.rs
+@@ -1631,6 +1631,11 @@ impl Game<'_> {
+                         }
+                     }
+                     HostEvent::Left(mut guest) => {
++                        #[cfg(feature = "mods")]
++                        self.mods.mods.network_peer_left(
++                            &super::mod_network::uuid_string(guest.uuid),
++                            u64::from(guest.conn),
++                        );
+                         // The container they had open loses an opener.
+                         if let Some(pos) = guest.menu.as_ref().and_then(|m| m.pos)
+                             && !guest.spectator()
+diff --git a/crates/horizon-client/src/game/lan_actions.rs b/crates/horizon-client/src/game/lan_actions.rs
+index abe655c65..e8a523a8b 100644
+--- a/crates/horizon-client/src/game/lan_actions.rs
++++ b/crates/horizon-client/src/game/lan_actions.rs
+@@ -1376,6 +1376,9 @@ impl Game<'_> {
+             S::CustomPayload(p) if p.channel == horizon_protocol::quiet::CHANNEL => {
+                 self.guest_quiet_commands(host, conn, &p.data)
+             }
++            S::CustomPayload(p) if p.channel == horizon_protocol::mod_channel::CHANNEL => {
++                self.guest_mod_network(host, conn, &p.data)
++            }
+             S::ChatCommandSigned(p) => self.guest_signed_command(host, conn, p),
+             S::ChangeDifficulty(p) if host.hub.guests[gi].permission >= 2 => {
+                 if !self.level.difficulty_locked && (0..=3).contains(&p.difficulty) {
+diff --git a/crates/horizon-client/src/game/mod_network.rs b/crates/horizon-client/src/game/mod_network.rs
+new file mode 100644
+index 000000000..d54db49f5
+--- /dev/null
++++ b/crates/horizon-client/src/game/mod_network.rs
+@@ -0,0 +1,108 @@
++//! Same-mod channels over real client/server custom payloads; in-frame uses
++//! the same inboxes as a loopback, without calling a guest reentrantly.
++use super::{Game, lan::LanHost};
++
++#[cfg(not(feature = "mods"))]
++impl Game<'_> {
++    pub(super) fn receive_mod_network(&mut self, _: &[u8]) {}
++    pub(super) fn guest_mod_network(&mut self, _: &mut LanHost, _: u32, _: &[u8]) {}
++}
++
++#[cfg(feature = "mods")]
++impl Game<'_> {
++    pub(super) fn receive_mod_network(&mut self, data: &[u8]) {
++        if self
++            .remote
++            .as_ref()
++            .is_none_or(|remote| !remote.mod_channel)
++        {
++            return;
++        }
++        if let Ok(message) = horizon_protocol::mod_channel::decode(data) {
++            self.mods
++                .mods
++                .receive_network(&message.mod_id, None, &message.data);
++        }
++    }
++    pub(super) fn guest_mod_network(&mut self, host: &mut LanHost, conn: u32, data: &[u8]) {
++        let Some(guest) = host.hub.guest(conn) else {
++            return;
++        };
++        let Ok(message) = horizon_protocol::mod_channel::decode(data) else {
++            return;
++        };
++        // Identity comes solely from the server's authenticated Guest.
++        let player = uuid_string(guest.uuid);
++        self.mods.mods.receive_network_from(
++            &message.mod_id,
++            &player,
++            &message.data,
++            u64::from(conn),
++        );
++    }
++    pub(super) fn send_mod_network(
++        &mut self,
++        host: Option<&mut LanHost>,
++        mod_id: String,
++        player: Option<String>,
++        connection: Option<u64>,
++        data: Vec<u8>,
++    ) {
++        use horizon_protocol::{
++            mod_channel,
++            packets::{configuration::CustomPayload, play},
++        };
++        let Ok(encoded) = mod_channel::encode(&mod_id, &data) else {
++            return;
++        };
++        match player {
++            None if self
++                .remote
++                .as_ref()
++                .is_some_and(|remote| remote.mod_channel) =>
++            {
++                self.send(play::Serverbound::CustomPayload(CustomPayload {
++                    channel: mod_channel::CHANNEL.into(),
++                    data: encoded,
++                }));
++            }
++            None if self.remote.is_none() && self.mods.server => {
++                let player = self.player_uuid_string();
++                self.mods
++                    .mods
++                    .receive_network(&mod_id, Some(&player), &data);
++            }
++            Some(player) => {
++                if self.options.execution_role.is_client()
++                    && self.remote.is_none()
++                    && self.player_uuid_string() == player
++                {
++                    self.mods.mods.receive_network(&mod_id, None, &data);
++                } else if let Some(host) = host.as_deref().or(self.lan.as_ref())
++                    && let Some(guest) = host.hub.guests.iter().find(|g| {
++                        uuid_string(g.uuid) == player && connection == Some(u64::from(g.conn))
++                    })
++                {
++                    guest.send(&play::Clientbound::CustomPayload(CustomPayload {
++                        channel: mod_channel::CHANNEL.into(),
++                        data: encoded,
++                    }));
++                }
++            }
++            _ => {}
++        }
++    }
++}
++
++#[cfg(feature = "mods")]
++pub(super) fn uuid_string(uuid: u128) -> String {
++    let value = format!("{uuid:032x}");
++    format!(
++        "{}-{}-{}-{}-{}",
++        &value[..8],
++        &value[8..12],
++        &value[12..16],
++        &value[16..20],
++        &value[20..]
++    )
++}
+diff --git a/crates/horizon-client/src/game/mods.rs b/crates/horizon-client/src/game/mods.rs
+index 52dc46fe0..afa0760f2 100644
+--- a/crates/horizon-client/src/game/mods.rs
++++ b/crates/horizon-client/src/game/mods.rs
+@@ -464,7 +464,13 @@ impl Game<'_> {
+                 .collect();
+         }
+         let (recipes, known_recipes) = self.mod_recipes();
++        let network_connected = player.is_some()
++            && self
++                .remote
++                .as_ref()
++                .map_or(self.mods.server, |remote| remote.mod_channel);
+         Snapshot {
++            network_connected,
+             player,
+             clock,
+             gui_size: self.gui_size(),
+@@ -666,6 +672,15 @@ impl Game<'_> {
+     pub(super) fn route_mod_output(&mut self, mut host: Option<&mut LanHost>) {
+         for output in self.mods.mods.drain() {
+             let line = match output {
++                Output::Network {
++                    mod_id,
++                    player,
++                    connection,
++                    data,
++                } => {
++                    self.send_mod_network(host.as_deref_mut(), mod_id, player, connection, data);
++                    continue;
++                }
+                 Output::Chat { name, text } => {
+                     let mut line = Text::literal(format!("[{name}] ")).with_color(text::GRAY);
+                     line.push(Text::literal(text));
+diff --git a/crates/horizon-client/src/game/remote.rs b/crates/horizon-client/src/game/remote.rs
+index 22b7c13df..d2d9b455f 100644
+--- a/crates/horizon-client/src/game/remote.rs
++++ b/crates/horizon-client/src/game/remote.rs
+@@ -111,6 +111,7 @@ pub(super) struct Remote {
+     pub brand: String,
+     /// The server announced it runs mods' quiet commands.
+     pub quiet_commands: bool,
++    pub mod_channel: bool,
+     pub(super) builtin: Arc<Builtin>,
+     lang: Arc<Language>,
+     pub(super) registries: Arc<Dynamic>,
+@@ -445,10 +446,13 @@ impl Game<'_> {
+         self.apply_settings();
+         self.clear_waypoints();
+         self.boss_overlay.reset();
++        #[cfg(feature = "mods")]
++        self.mods.mods.network_disconnected();
+         self.remote = Some(Remote {
+             session,
+             brand: "unknown".into(),
+             quiet_commands: false,
++            mod_channel: false,
+             builtin: Arc::new(builtin),
+             lang,
+             registries: Arc::new(Dynamic::default()),
+@@ -886,6 +890,18 @@ impl Game<'_> {
+                         remote.quiet_commands = true;
+                     }
+                 }
++                Event::ModChannel => {
++                    if let Some(remote) = &mut self.remote {
++                        remote.mod_channel = true;
++                    }
++                }
++                Event::ModChannelReset => {
++                    if let Some(remote) = &mut self.remote {
++                        remote.mod_channel = false;
++                    }
++                    #[cfg(feature = "mods")]
++                    self.mods.mods.network_disconnected();
++                }
+                 Event::Reconfigured(registries) => {
+                     self.boss_overlay.reset();
+                     self.set_registries(registries);
+@@ -1717,6 +1733,9 @@ impl Game<'_> {
+ 
+     fn handle_packet(&mut self, packet: C) -> Result<()> {
+         match packet {
++            C::CustomPayload(p) if p.channel == horizon_protocol::mod_channel::CHANNEL => {
++                self.receive_mod_network(&p.data);
++            }
+             // ClientCommonPacketListenerImpl.handlePing runs on the game
+             // thread, after all preceding packets (especially teleports).
+             C::Ping(p) => self.send(S::Pong(p)),
+diff --git a/crates/horizon-client/src/lan/conn.rs b/crates/horizon-client/src/lan/conn.rs
+index 99b70e065..ed70d1de8 100644
+--- a/crates/horizon-client/src/lan/conn.rs
++++ b/crates/horizon-client/src/lan/conn.rs
+@@ -836,6 +836,15 @@ fn login_and_configure(
+     // A Horizon client hears that this server runs its mods' quiet commands
+     // (horizon_protocol::quiet); a vanilla one is told nothing.
+     if brand == "horizon" {
++        if cfg!(feature = "mods") {
++            send(
++                c,
++                cfg::Clientbound::CustomPayload(cfg::CustomPayload {
++                    channel: horizon_protocol::mod_channel::CHANNEL.into(),
++                    data: Vec::new(),
++                }),
++            )?;
++        }
+         send(
+             c,
+             cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+diff --git a/crates/horizon-client/src/net.rs b/crates/horizon-client/src/net.rs
+index 93364ed91..88e156e8b 100644
+--- a/crates/horizon-client/src/net.rs
++++ b/crates/horizon-client/src/net.rs
+@@ -42,6 +42,10 @@ pub enum Event {
+     Brand(String),
+     /// The server runs mods' quiet commands (`horizon_protocol::quiet`).
+     QuietCommands,
++    /// The server supports same-mod custom payloads.
++    ModChannel,
++    /// Configuration restarted; the replacement server must announce support again.
++    ModChannelReset,
+     /// Configuration finished: the play state begins with these registries.
+     Joined {
+         registries: Arc<Dynamic>,
+@@ -552,6 +556,7 @@ fn receive_play(
+                     let _ = w.send(&play::Serverbound::ConfigurationAcknowledged(Empty).encode());
+                     configuring.store(true, Ordering::Relaxed);
+                 }
++                let _ = send.send(Event::ModChannelReset);
+                 let registries =
+                     configure(reader, shared_writer, configuring, lang, send, cookies)?;
+                 let _ = send.send(Event::Reconfigured(Arc::new(registries)));
+@@ -681,6 +686,8 @@ fn receive_brand(payload: &cfg::CustomPayload, send: &Sender<Event>) {
+         let _ = send.send(Event::Brand(brand));
+     } else if payload.channel == horizon_protocol::quiet::CHANNEL {
+         let _ = send.send(Event::QuietCommands);
++    } else if payload.channel == horizon_protocol::mod_channel::CHANNEL && payload.data.is_empty() {
++        let _ = send.send(Event::ModChannel);
+     }
+ }
+ 
+@@ -971,4 +978,18 @@ mod tests {
+         receive_brand(&payload, &send);
+         assert!(events.try_recv().is_err());
+     }
++
++    #[test]
++    fn mod_channel_support_requires_an_empty_announcement() {
++        let (send, events) = channel();
++        let mut payload = cfg::CustomPayload {
++            channel: horizon_protocol::mod_channel::CHANNEL.into(),
++            data: vec![1],
++        };
++        receive_brand(&payload, &send);
++        assert!(events.try_recv().is_err());
++        payload.data.clear();
++        receive_brand(&payload, &send);
++        assert!(matches!(events.try_recv(), Ok(Event::ModChannel)));
++    }
+ }
+diff --git a/crates/horizon-mod-sdk/src/lib.rs b/crates/horizon-mod-sdk/src/lib.rs
+index 1e7120091..808a3fbed 100644
+--- a/crates/horizon-mod-sdk/src/lib.rs
++++ b/crates/horizon-mod-sdk/src/lib.rs
+@@ -40,7 +40,7 @@ wit_bindgen::generate!({
+ pub use exports::horizon::mods::events::{Guest as __Guest, Registration};
+ pub use exports::horizon::mods::ui_events::Guest as __UiEventsGuest;
+ pub use horizon::mods::{
+-    browser, chat, command, game, hud, input, log, recipes, render, storage, ui,
++    browser, chat, command, game, hud, input, log, net, recipes, render, storage, ui,
+ };
+ 
+ /// The game's calls into a mod. Only the hooks [`Registration`] asks for
+@@ -191,6 +191,7 @@ pub mod server {
+         with: {
+             "horizon:mods/log@0.1.0": crate::log,
+             "horizon:mods/storage@0.1.0": crate::storage,
++            "horizon:mods/net@0.1.0": crate::net,
+         },
+     });
+ 
+diff --git a/crates/horizon-mod-sdk/wit/horizon.wit b/crates/horizon-mod-sdk/wit/horizon.wit
+index 0680cce92..56cc6da16 100644
+--- a/crates/horizon-mod-sdk/wit/horizon.wit
++++ b/crates/horizon-mod-sdk/wit/horizon.wit
+@@ -783,6 +783,40 @@ interface server-events {
+     block-placed: func(player: player, pos: block-pos, state: string);
+ }
+ 
++/// Capability `net` (experimental): a connection-scoped channel between the
++/// client and server components with the SAME mod id. Never an internet socket.
++interface net {
++    /// Opaque host-generated connection token, not a player identity or permission.
++    record session { high: u64, low: u64 }
++    record message {
++        /// On the server, the authenticated sender's UUID. On the client, none.
++        player: option<string>,
++        /// Server only: host token captured at enqueue time. Compare with
++        /// session-token if retaining a message across ticks/reconnections.
++        session: option<session>,
++        data: list<u8>,
++    }
++    variant event {
++        received(message),
++        /// Client connection ended or changed. Discard old session/prediction.
++        disconnected,
++    }
++    /// Client: the server announced channel support. Server: false (use the
++    /// online players instead). No channel is available on a vanilla server.
++    connected: func() -> bool;
++    /// Server only: fresh token for this player's current authenticated
++    /// connection, available after its first received message. None elsewhere.
++    session-token: func(player: string) -> option<session>;
++    /// Client: player must be none, sends to its server. Server: player must
++    /// name an online player's UUID. Host supplies the sending mod id and
++    /// authenticates players; bytes never select their sender. At most 16 KiB
++    /// per message and 8 messages per hook. An error queues nothing.
++    send: func(player: option<string>, data: list<u8>) -> result<_, string>;
++    /// Events in arrival order. Bounded to 64 events / 256 KiB; no polling
++    /// does not grant unbounded memory. Disconnect clears old queued messages.
++    poll: func() -> list<event>;
++}
++
+ /// A client mod: runs in the player's game.
+ world horizon-mod {
+     import log;
+@@ -791,6 +825,7 @@ world horizon-mod {
+     import hud;
+     import storage;
+     import command;
++    import net;
+     export events;
+ }
+ 
+@@ -802,6 +837,7 @@ world horizon-server-mod {
+     import storage;
+     import players;
+     import %world;
++    import net;
+     export server-events;
+ }
+ 
+diff --git a/crates/horizon-mods/Cargo.toml b/crates/horizon-mods/Cargo.toml
+index 8bfa58bcd..05db437a4 100644
+--- a/crates/horizon-mods/Cargo.toml
++++ b/crates/horizon-mods/Cargo.toml
+@@ -12,6 +12,7 @@ serde_json = "1"
+ toml = "1.1.6"
+ zip = { version = "2", default-features = false, features = ["deflate"] }
+ log = "0.4"
++getrandom = { version = "0.2", optional = true }
+ # The 48 LTS line: security fixes until August 2028, on the same wasm-tools (0.254) as wit-component and the SDK's wit-bindgen.
+ wasmtime = { version = "48.0.7", default-features = false, features = ["runtime", "cranelift", "component-model", "std"], optional = true }
+ # Turns a mod's core module into a component (cargo horizon-mod build, the tests).
+@@ -34,7 +35,7 @@ wit-parser = "0.254"
+ # Loads and runs mods (the game's `mods` feature); without it only manifests,
+ # content and packaging. Off by default so builds that don't run mods (the
+ # game's tests and probes) skip wasmtime and cranelift.
+-runtime = ["dep:wasmtime", "dep:wasmparser"]
++runtime = ["dep:wasmtime", "dep:wasmparser", "dep:getrandom"]
+ pack = ["dep:wit-component", "dep:wit-parser"]
+ # The mod registry's index (docs/api/mod-index.md): the launcher, the registry server and its CI.
+ index = ["dep:sha2", "dep:minisign-verify", "dep:horizon-shader-api", "dep:wasmparser"]
+@@ -49,5 +50,9 @@ required-features = ["runtime", "pack"]
+ name = "api_reference"
+ required-features = ["pack"]
+ 
++[[test]]
++name = "network"
++required-features = ["runtime", "pack"]
++
+ [lints]
+ workspace = true
+diff --git a/crates/horizon-mods/src/api_level.rs b/crates/horizon-mods/src/api_level.rs
+index 045a9346b..421408507 100644
+--- a/crates/horizon-mods/src/api_level.rs
++++ b/crates/horizon-mods/src/api_level.rs
+@@ -7,13 +7,13 @@
+ //! version's level so the launcher can tell before it installs.
+ 
+ /// The newest level this Horizon serves.
+-pub const LEVEL: u32 = 7;
++pub const LEVEL: u32 = 8;
+ 
+ /// Every function the game offers mods, as `interface.function`, with its
+ /// level. Level 0 is the contract of Horizon 0.2.67 to 0.2.69. A new
+ /// function takes the next level and raises [`LEVEL`] (the `api_reference`
+ /// test fails until it is listed here).
+-pub const FUNCTIONS: [(&str, u32); 46] = [
++pub const FUNCTIONS: [(&str, u32); 50] = [
+     ("log.write", 0),
+     ("game.get-player", 0),
+     ("game.get-clock", 0),
+@@ -60,6 +60,10 @@ pub const FUNCTIONS: [(&str, u32); 46] = [
+     ("recipes.place", 6),
+     ("recipes.give", 6),
+     ("render.set-far-terrain", 7),
++    ("net.connected", 8),
++    ("net.session-token", 8),
++    ("net.send", 8),
++    ("net.poll", 8),
+ ];
+ 
+ /// What the game's program carries so the launcher can read its level
+diff --git a/crates/horizon-mods/src/manifest.rs b/crates/horizon-mods/src/manifest.rs
+index c2f2f61fc..f4da87dc6 100644
+--- a/crates/horizon-mods/src/manifest.rs
++++ b/crates/horizon-mods/src/manifest.rs
+@@ -103,9 +103,11 @@ pub enum Capability {
+     /// The recipes and items the game knows, for recipe viewers
+     /// (interface `recipes`).
+     Recipes,
++    /// Connection-scoped bytes between this mod's client and server halves.
++    Net,
+ }
+ impl Capability {
+-    pub const ALL: [Capability; 12] = [
++    pub const ALL: [Capability; 13] = [
+         Capability::GameRead,
+         Capability::Chat,
+         Capability::Hud,
+@@ -118,12 +120,13 @@ impl Capability {
+         Capability::Players,
+         Capability::World,
+         Capability::Recipes,
++        Capability::Net,
+     ];
+     /// Whether a server mod may have it: the others act on a local player.
+     pub fn on_server(self) -> bool {
+         matches!(
+             self,
+-            Capability::Storage | Capability::Players | Capability::World
++            Capability::Storage | Capability::Players | Capability::World | Capability::Net
+         )
+     }
+     /// The WIT interface it grants, in `horizon:mods`.
+@@ -141,6 +144,7 @@ impl Capability {
+             Capability::Players => "players",
+             Capability::World => "world",
+             Capability::Recipes => "recipes",
++            Capability::Net => "net",
+         }
+     }
+     /// May change in any release: a mod uses it only with
+@@ -148,7 +152,11 @@ impl Capability {
+     pub fn is_experimental(self) -> bool {
+         matches!(
+             self,
+-            Capability::Ui | Capability::Render | Capability::Input | Capability::Recipes
++            Capability::Ui
++                | Capability::Render
++                | Capability::Input
++                | Capability::Recipes
++                | Capability::Net
+         )
+     }
+     /// What the player reads before turning the mod on: "May <this>".
+@@ -170,6 +178,9 @@ impl Capability {
+             Capability::Recipes => {
+                 "read the game's recipes and items and which recipes you know, place recipes in your crafting grid and, in creative mode, give you items"
+             }
++            Capability::Net => {
++                "exchange data with its matching component on the game server or clients"
++            }
+         }
+     }
+     /// The capability a component import needs, `Ok(None)` for one every
+@@ -211,6 +222,7 @@ impl fmt::Display for Capability {
+             Capability::Players => "players",
+             Capability::World => "world",
+             Capability::Recipes => "recipes",
++            Capability::Net => "net",
+         };
+         f.write_str(name)
+     }
+@@ -247,11 +259,9 @@ impl Manifest {
+                 "{MANIFEST}: a server mod is side = \"server\" with api = \"{SERVER_API}\", and only it"
+             ));
+         }
+-        if let Some(c) = m
+-            .capabilities
+-            .iter()
+-            .find(|c| c.on_server() != server && **c != Capability::Storage)
+-        {
++        if let Some(c) = m.capabilities.iter().find(|c| {
++            c.on_server() != server && !matches!(c, Capability::Storage | Capability::Net)
++        }) {
+             let side = if server { "client" } else { "server" };
+             return Err(format!("{MANIFEST}: capability {c} is for {side} mods"));
+         }
+diff --git a/crates/horizon-mods/src/runtime.rs b/crates/horizon-mods/src/runtime.rs
+index cff44722b..08702e91d 100644
+--- a/crates/horizon-mods/src/runtime.rs
++++ b/crates/horizon-mods/src/runtime.rs
+@@ -15,6 +15,11 @@ use wasmtime::{
+     component::{Component, HasSelf, Linker},
+ };
+ 
++mod network;
++use bindings::horizon::mods::net;
++pub use bindings::horizon::mods::net::{Event as NetworkEvent, Message as NetworkMessage};
++use network::NetworkState;
++
+ mod bindings {
+     wasmtime::component::bindgen!({
+         path: "../horizon-mod-sdk/wit",
+@@ -30,6 +35,7 @@ mod server_bindings {
+         with: {
+             "horizon:mods/log": super::bindings::horizon::mods::log,
+             "horizon:mods/storage": super::bindings::horizon::mods::storage,
++            "horizon:mods/net": super::bindings::horizon::mods::net,
+         },
+     });
+ }
+@@ -136,6 +142,8 @@ const STORAGE_WRITE_BUDGET: u64 = 1 << 20;
+ /// What mods may read of the game, copied once per tick by the game.
+ #[derive(Clone, Debug, Default)]
+ pub struct Snapshot {
++    /// The local connection announced the mod channel (or is in-frame loopback).
++    pub network_connected: bool,
+     pub player: Option<Player>,
+     pub clock: Option<Clock>,
+     /// The screen in GUI pixels (capability `render`'s `gui-size`).
+@@ -198,6 +206,15 @@ impl Runs {
+ /// What mods asked the game to show since the last [`Mods::drain`].
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum Output {
++    /// Authenticated, same-mod traffic. None targets this client's server;
++    /// Some targets that online player's client. Sending mod id is host-owned.
++    Network {
++        mod_id: String,
++        player: Option<String>,
++        /// Server-side authenticated connection generation, never client-supplied.
++        connection: Option<u64>,
++        data: Vec<u8>,
++    },
+     /// `chat.show`: a line after the mod's name.
+     Chat { name: String, text: String },
+     /// A mod command's feedback, red when `error`.
+@@ -400,6 +417,7 @@ impl BrowserState {
+ }
+ 
+ struct State {
++    network: NetworkState,
+     name: String,
+     id: String,
+     snapshot: Arc<Snapshot>,
+@@ -567,13 +585,14 @@ impl Mods {
+         let Some(wasm) = &package.wasm else {
+             return Ok(None);
+         };
+-        // Two running mods with the same id would share one `data_dir`
+-        // (capability `storage`): the first loaded keeps the id.
+-        if self
+-            .entries
+-            .iter()
+-            .any(|e| e.run.is_some() && e.manifest.as_ref().is_some_and(|other| other.id == m.id))
+-        {
++        // One owner per id AND execution side. A client/server pair intentionally
++        // shares its id so the host can route its private channel in-frame too.
++        if self.entries.iter().any(|e| {
++            e.run.is_some()
++                && e.manifest.as_ref().is_some_and(|other| {
++                    other.id == m.id && (other.side == Side::Server) == (m.side == Side::Server)
++                })
++        }) {
+             return Err(format!("another running mod already uses id {}", m.id));
+         }
+         let server = m.side == Side::Server;
+@@ -608,6 +627,7 @@ impl Mods {
+             .join(crate::manifest::STORAGE_DIR)
+             .join(&m.id);
+         let state = State {
++            network: NetworkState::new(server),
+             name: m.name.clone(),
+             id: m.id.clone(),
+             snapshot,
+@@ -766,6 +786,7 @@ impl Mods {
+         let run = entry.run.as_mut()?;
+         run.store.data_mut().snapshot = self.snapshot.clone();
+         run.store.data_mut().storage_budget = STORAGE_WRITE_BUDGET;
++        run.store.data_mut().network.sent = 0;
+         let started = Instant::now();
+         let result = run.store.set_fuel(fuel).and_then(|()| f(run));
+         // An average over about the last 64 calls.
+@@ -775,6 +796,10 @@ impl Mods {
+             std::mem::take(&mut data.ui.open),
+             std::mem::take(&mut data.ui.close),
+         );
++        // A failing hook must not send half of a network transaction.
++        if result.is_err() {
++            data.out.retain(|o| !matches!(o, Output::Network { .. }));
++        }
+         self.out.append(&mut data.out);
+         if open {
+             self.out.push(Output::OpenScreen { owner: i });
+@@ -869,6 +894,7 @@ impl Mods {
+     }
+     /// `player` left the server (they are no longer in the snapshot's players).
+     pub fn player_left(&mut self, player: &ServerPlayer) {
++        self.network_player_left(&player.id);
+         self.each_server(
+             FUEL_EVENT,
+             |h| h.joins,
+diff --git a/crates/horizon-mods/src/runtime/network.rs b/crates/horizon-mods/src/runtime/network.rs
+new file mode 100644
+index 000000000..7cc25fd3a
+--- /dev/null
++++ b/crates/horizon-mods/src/runtime/network.rs
+@@ -0,0 +1,275 @@
++//! Capability `net`: bounded inboxes and queued outputs; never reentrant guest calls.
++use super::{Mods, NetworkEvent, NetworkMessage, Output, Side, State, net};
++use std::collections::{HashMap, VecDeque};
++
++pub const MAX_DATA: usize = 16 * 1024;
++const MAX_EVENTS: usize = 64;
++const MAX_BYTES: usize = 256 * 1024;
++const PER_CALL: usize = 8;
++
++pub(super) struct NetworkState {
++    server: bool,
++    events: VecDeque<NetworkEvent>,
++    bytes: usize,
++    pub(super) sent: usize,
++    tokens: HashMap<String, (u64, net::Session)>,
++}
++impl NetworkState {
++    pub(super) fn new(server: bool) -> Self {
++        Self {
++            server,
++            events: VecDeque::new(),
++            bytes: 0,
++            sent: 0,
++            tokens: HashMap::new(),
++        }
++    }
++    fn push(&mut self, mut message: NetworkMessage, connection: u64) -> bool {
++        if message.data.len() > MAX_DATA {
++            return false;
++        }
++        if self.server
++            && let Some(player) = message.player.as_deref()
++        {
++            if self
++                .tokens
++                .get(player)
++                .is_some_and(|(old, _)| *old != connection)
++            {
++                self.remove_player(player);
++            }
++            if !self.tokens.contains_key(player) {
++                if self.tokens.len() >= 1024 {
++                    return false;
++                }
++                let mut bytes = [0; 16];
++                if getrandom::getrandom(&mut bytes).is_err() || bytes == [0; 16] {
++                    return false;
++                }
++                let token = net::Session {
++                    high: u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes")),
++                    low: u64::from_le_bytes(bytes[8..].try_into().expect("eight bytes")),
++                };
++                self.tokens.insert(player.to_owned(), (connection, token));
++            }
++            message.session = self.tokens.get(player).map(|(_, token)| *token);
++        }
++        if message.data.len() > MAX_DATA
++            || self.events.len() >= MAX_EVENTS
++            || self.bytes + message.data.len() > MAX_BYTES
++        {
++            return false;
++        }
++        self.bytes += message.data.len();
++        self.events.push_back(NetworkEvent::Received(message));
++        true
++    }
++    fn disconnect(&mut self) {
++        self.events.clear();
++        self.bytes = 0;
++        self.events.push_back(NetworkEvent::Disconnected);
++    }
++    fn remove_player(&mut self, player: &str) {
++        self.tokens.remove(player);
++        self.events.retain(|event| {
++            !matches!(event,
++            NetworkEvent::Received(message) if message.player.as_deref() == Some(player))
++        });
++        self.bytes = self
++            .events
++            .iter()
++            .map(|event| match event {
++                NetworkEvent::Received(message) => message.data.len(),
++                _ => 0,
++            })
++            .sum();
++    }
++}
++
++impl Mods {
++    /// Caller supplies the sender from its authenticated connection. None means
++    /// a server-to-client delivery. Unknown ids, wrong sides and full inboxes fail.
++    /// This enqueues only; the recipient sees it on its next poll.
++    pub fn receive_network(&mut self, mod_id: &str, player: Option<&str>, data: &[u8]) -> bool {
++        self.receive_network_on(mod_id, player, data, 0)
++    }
++    /// Network hosts pass the actual connection generation so an immediate
++    /// reconnect with the same player UUID still gets a fresh session token.
++    pub fn receive_network_from(
++        &mut self,
++        mod_id: &str,
++        player: &str,
++        data: &[u8],
++        connection: u64,
++    ) -> bool {
++        self.receive_network_on(mod_id, Some(player), data, connection)
++    }
++    fn receive_network_on(
++        &mut self,
++        mod_id: &str,
++        player: Option<&str>,
++        data: &[u8],
++        connection: u64,
++    ) -> bool {
++        if data.len() > MAX_DATA {
++            return false;
++        }
++        let server = player.is_some();
++        let Some(entry) = self.entries.iter_mut().find(|e| {
++            e.run.is_some()
++                && e.manifest.as_ref().is_some_and(|m| {
++                    m.id == mod_id
++                        && (m.side == Side::Server) == server
++                        && m.capabilities.contains(&crate::Capability::Net)
++                })
++        }) else {
++            return false;
++        };
++        entry
++            .run
++            .as_mut()
++            .expect("running entry")
++            .store
++            .data_mut()
++            .network
++            .push(
++                NetworkMessage {
++                    player: player.map(str::to_owned),
++                    session: None,
++                    data: data.to_vec(),
++                },
++                connection,
++            )
++    }
++    /// Called on close AND before replacing a connection: old traffic never
++    /// crosses into another server. Keep a notification even while no tick runs.
++    pub fn network_disconnected(&mut self) {
++        self.out
++            .retain(|o| !matches!(o, Output::Network { player: None, .. }));
++        for run in self.entries.iter_mut().filter_map(|e| e.run.as_mut()) {
++            let state = run.store.data_mut();
++            if !state.network.server {
++                state.network.disconnect();
++                state.out.retain(|o| !matches!(o, Output::Network { .. }));
++            }
++        }
++        std::sync::Arc::make_mut(&mut self.snapshot).network_connected = false;
++    }
++    pub(super) fn network_player_left(&mut self, player: &str) {
++        self.out
++            .retain(|o| !matches!(o, Output::Network { player: Some(p), .. } if p == player));
++        for run in self.entries.iter_mut().filter_map(|e| e.run.as_mut()) {
++            let state = run.store.data_mut();
++            state.network.remove_player(player);
++            state
++                .out
++                .retain(|o| !matches!(o, Output::Network { player: Some(p), .. } if p == player));
++        }
++    }
++    /// Drop traffic/token only for the departed connection, not a newer one
++    /// which already reconnected using that player's UUID.
++    pub fn network_peer_left(&mut self, player: &str, connection: u64) {
++        for run in self.entries.iter_mut().filter_map(|e| e.run.as_mut()) {
++            let state = run.store.data_mut();
++            if state
++                .network
++                .tokens
++                .get(player)
++                .is_some_and(|(key, _)| *key == connection)
++            {
++                state.network.remove_player(player);
++                state.out.retain(
++                    |o| !matches!(o, Output::Network { player: Some(p), .. } if p == player),
++                );
++            }
++        }
++        self.out.retain(|o| !matches!(o, Output::Network { player: Some(p), connection: Some(key), .. } if p == player && *key == connection));
++    }
++}
++
++impl net::Host for State {
++    fn session_token(&mut self, player: String) -> Option<net::Session> {
++        self.network.tokens.get(&player).map(|(_, token)| *token)
++    }
++    fn connected(&mut self) -> bool {
++        !self.network.server && self.snapshot.network_connected
++    }
++    fn send(&mut self, player: Option<String>, data: Vec<u8>) -> Result<(), String> {
++        if data.len() > MAX_DATA || self.network.sent >= PER_CALL {
++            return Err("net: message or per-hook limit exceeded".into());
++        }
++        match (&player, self.network.server) {
++            (None, false) if self.snapshot.network_connected => {}
++            (Some(id), true)
++                if self.snapshot.players.iter().any(|p| &p.id == id)
++                    && self.network.tokens.contains_key(id) => {}
++            _ => return Err("net: disconnected, wrong destination side or player offline".into()),
++        }
++        self.network.sent += 1;
++        self.out.push(Output::Network {
++            mod_id: self.id.clone(),
++            connection: player
++                .as_ref()
++                .and_then(|id| self.network.tokens.get(id).map(|(key, _)| *key)),
++            player,
++            data,
++        });
++        Ok(())
++    }
++    fn poll(&mut self) -> Vec<NetworkEvent> {
++        self.network.bytes = 0;
++        self.network.events.drain(..).collect()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn message(player: &str, len: usize) -> NetworkMessage {
++        NetworkMessage {
++            player: Some(player.into()),
++            session: None,
++            data: vec![0; len],
++        }
++    }
++    #[test]
++    fn queues_are_bounded_by_events_and_bytes_without_losing_old_messages() {
++        let mut queue = NetworkState::new(true);
++        for _ in 0..MAX_EVENTS {
++            assert!(queue.push(message("a", 0), 0));
++        }
++        assert!(!queue.push(message("b", 0), 0));
++        let mut queue = NetworkState::new(true);
++        for _ in 0..MAX_BYTES / MAX_DATA {
++            assert!(queue.push(message("a", MAX_DATA), 0));
++        }
++        assert!(!queue.push(message("b", 1), 0));
++        assert!(!queue.push(message("b", MAX_DATA + 1), 0));
++    }
++    #[test]
++    fn disconnect_and_departure_clear_stale_traffic() {
++        let mut queue = NetworkState::new(true);
++        assert!(queue.push(message("a", 10), 0));
++        assert!(queue.push(message("b", 20), 0));
++        queue.remove_player("a");
++        assert_eq!(queue.bytes, 20);
++        queue.disconnect();
++        assert_eq!(queue.bytes, 0);
++        assert!(matches!(
++            queue.events.front(),
++            Some(NetworkEvent::Disconnected)
++        ));
++        assert_eq!(queue.events.len(), 1);
++    }
++    #[test]
++    fn connection_generation_rotates_tokens_for_the_same_player() {
++        let mut queue = NetworkState::new(true);
++        assert!(queue.push(message("a", 1), 1));
++        let old = queue.tokens["a"].1;
++        assert!(queue.push(message("a", 1), 2));
++        let new = queue.tokens["a"].1;
++        assert!(old.high != new.high || old.low != new.low);
++        assert_eq!(queue.tokens["a"].0, 2);
++        assert_eq!(queue.events.len(), 1);
++    }
++}
+diff --git a/crates/horizon-mods/tests/guest/Cargo.toml b/crates/horizon-mods/tests/guest/Cargo.toml
+index 0e725324a..2e4ad907c 100644
+--- a/crates/horizon-mods/tests/guest/Cargo.toml
++++ b/crates/horizon-mods/tests/guest/Cargo.toml
+@@ -9,6 +9,10 @@ description = "A mod that misbehaves on command, for horizon-mods' sandbox tests
+ [lib]
+ crate-type = ["cdylib"]
+ 
++[features]
++network = []
++server-network = ["network"]
++
+ [dependencies]
+ horizon-mod-sdk = { path = "../../../horizon-mod-sdk" }
+ 
+diff --git a/crates/horizon-mods/tests/guest/src/lib.rs b/crates/horizon-mods/tests/guest/src/lib.rs
+index 674c5e995..156d65735 100644
+--- a/crates/horizon-mods/tests/guest/src/lib.rs
++++ b/crates/horizon-mods/tests/guest/src/lib.rs
+@@ -3,61 +3,146 @@
+ //! capability `storage` on a fixed key, `/save_key <key> <text>` exercises
+ //! it on an arbitrary key (for the quota and key-count limits); `tick` and
+ //! `frame` do nothing, to measure the cost of a call.
+-use horizon_mod_sdk::{Mod, Registration, chat, storage};
++#[cfg(not(feature = "server-network"))]
++mod client {
++    use horizon_mod_sdk::{Mod, Registration, chat, storage};
+ 
+-struct Guest {
+-    ticks: u64,
+-}
++    struct Guest {
++        ticks: u64,
++    }
+ 
+-impl Mod for Guest {
+-    fn init() -> Result<(Self, Registration), String> {
+-        let hooks = ["spin", "panic", "grow", "hello", "save", "load", "save_key"]
++    impl Mod for Guest {
++        fn init() -> Result<(Self, Registration), String> {
++            let hooks = ["spin", "panic", "grow", "hello", "save", "load", "save_key"]
++                .into_iter()
++                .fold(Registration::new(), Registration::command)
++                .on_tick()
++                .on_frame();
++            #[cfg(feature = "network")]
++            let hooks = [
++                "net_send",
++                "net_spoof",
++                "net_poll",
++                "net_connected",
++                "net_burst",
++                "net_panic",
++            ]
+             .into_iter()
+-            .fold(Registration::new(), Registration::command)
+-            .on_tick()
+-            .on_frame();
+-        Ok((Guest { ticks: 0 }, hooks))
+-    }
+-    fn tick(&mut self, _tick: u64) {
+-        self.ticks += 1;
+-    }
+-    fn command(&mut self, name: &str, args: &str) -> Result<Option<String>, String> {
+-        match name {
+-            "spin" => {
+-                let mut n = 0u64;
+-                while std::hint::black_box(n) != u64::MAX {
+-                    n = n.wrapping_add(2);
+-                }
+-                Ok(None)
+-            }
+-            "panic" => panic!("asked to"),
+-            "grow" => {
+-                let big = std::hint::black_box(vec![1u8; 1 << 30]);
+-                Ok(Some(format!("{}", big.len())))
++            .fold(hooks, Registration::command);
++            Ok((Guest { ticks: 0 }, hooks))
++        }
++        fn tick(&mut self, _tick: u64) {
++            self.ticks += 1;
++        }
++        fn command(&mut self, name: &str, args: &str) -> Result<Option<String>, String> {
++            #[cfg(feature = "network")]
++            if name.starts_with("net_") {
++                return network_command(name, args);
+             }
+-            "save" => {
+-                storage::set("note", args.as_bytes())?;
+-                Ok(Some("saved".into()))
++            match name {
++                "spin" => {
++                    let mut n = 0u64;
++                    while std::hint::black_box(n) != u64::MAX {
++                        n = n.wrapping_add(2);
++                    }
++                    Ok(None)
++                }
++                "panic" => panic!("asked to"),
++                "grow" => {
++                    let big = std::hint::black_box(vec![1u8; 1 << 30]);
++                    Ok(Some(format!("{}", big.len())))
++                }
++                "save" => {
++                    storage::set("note", args.as_bytes())?;
++                    Ok(Some("saved".into()))
++                }
++                "load" => {
++                    let text = storage::get("note")
++                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
++                    chat::show(text.as_deref().unwrap_or("(empty)"));
++                    Ok(None)
++                }
++                "save_key" => {
++                    let (key, text) = args
++                        .split_once(' ')
++                        .ok_or("Usage: /save_key <key> <text>")?;
++                    storage::set(key, text.as_bytes())?;
++                    Ok(Some("saved".into()))
++                }
++                _ => {
++                    chat::show(&format!("hello {args} after {} ticks", self.ticks));
++                    Ok(None)
++                }
+             }
+-            "load" => {
+-                let text =
+-                    storage::get("note").map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+-                chat::show(text.as_deref().unwrap_or("(empty)"));
+-                Ok(None)
++        }
++    }
++
++    horizon_mod_sdk::export_mod!(Guest);
++
++    #[cfg(feature = "network")]
++    fn network_command(name: &str, args: &str) -> Result<Option<String>, String> {
++        use horizon_mod_sdk::net;
++        match name {
++            "net_send" => net::send(None, args.as_bytes())?,
++            "net_spoof" => net::send(Some("forged-player"), args.as_bytes())?,
++            "net_poll" => {
++                return Ok(Some(
++                    net::poll()
++                        .into_iter()
++                        .map(|event| match event {
++                            net::Event::Disconnected => "disconnected".into(),
++                            net::Event::Received(message) => format!(
++                                "{}:{}",
++                                message.player.as_deref().unwrap_or("server"),
++                                String::from_utf8_lossy(&message.data)
++                            ),
++                        })
++                        .collect::<Vec<_>>()
++                        .join("|"),
++                ));
+             }
+-            "save_key" => {
+-                let (key, text) = args
+-                    .split_once(' ')
+-                    .ok_or("Usage: /save_key <key> <text>")?;
+-                storage::set(key, text.as_bytes())?;
+-                Ok(Some("saved".into()))
++            "net_connected" => return Ok(Some(net::connected().to_string())),
++            "net_burst" => {
++                for _ in 0..8 {
++                    net::send(None, b"ok")?;
++                }
++                return Ok(Some(
++                    if net::send(None, b"overflow").is_err() {
++                        "limited"
++                    } else {
++                        "unbounded"
++                    }
++                    .into(),
++                ));
+             }
+-            _ => {
+-                chat::show(&format!("hello {args} after {} ticks", self.ticks));
+-                Ok(None)
++            "net_panic" => {
++                net::send(None, b"half")?;
++                panic!("after send");
+             }
++            _ => return Err("unknown network command".into()),
+         }
++        Ok(None)
+     }
+ }
+ 
+-horizon_mod_sdk::export_mod!(Guest);
++#[cfg(feature = "server-network")]
++mod server {
++    use horizon_mod_sdk::{
++        net,
++        server::{Registration, ServerMod},
++    };
++    struct Echo;
++    impl ServerMod for Echo {
++        fn init() -> Result<(Self, Registration), String> {
++            Ok((Self, Registration::new().on_tick()))
++        }
++        fn tick(&mut self, _: u64) {
++            for event in net::poll() {
++                if let net::Event::Received(message) = event {
++                    let _ = net::send(message.player.as_deref(), &message.data);
++                }
++            }
++        }
++    }
++    horizon_mod_sdk::export_server_mod!(Echo);
++}
+diff --git a/crates/horizon-mods/tests/network.rs b/crates/horizon-mods/tests/network.rs
+new file mode 100644
+index 000000000..b15dacd5d
+--- /dev/null
++++ b/crates/horizon-mods/tests/network.rs
+@@ -0,0 +1,227 @@
++//! Real WASM client/server components exercising the connection-bound capability.
++use horizon_mods::{
++    Mods, Output, Package, Runs, ServerPlayer, Snapshot, Status, manifest::componentize,
++};
++use std::{
++    path::{Path, PathBuf},
++    process::Command,
++    sync::OnceLock,
++};
++
++fn guests() -> &'static (PathBuf, PathBuf) {
++    static GUESTS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
++    GUESTS.get_or_init(|| {
++        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
++        let target = root.join("target/mods-net-test");
++        let mut paths = Vec::new();
++        for (side, feature, api, extra) in [
++            ("client", "network", "0.1", ", \"chat\", \"storage\""),
++            ("server", "server-network", "0.3", ", \"players\""),
++        ] {
++            let status = Command::new(env!("CARGO")).current_dir(&root)
++                .args(["build", "--release", "--target", "wasm32-unknown-unknown", "-p", "horizon-mods-test-guest", "--features", feature, "--target-dir"])
++                .arg(&target).status().unwrap();
++            assert!(status.success(), "the WASM test target must be installed");
++            let core = std::fs::read(target.join("wasm32-unknown-unknown/release/horizon_mods_test_guest.wasm")).unwrap();
++            let manifest = format!("id = \"channel_test\"\nname = \"Channel {side}\"\nversion = \"1\"\napi = \"{api}\"\nside = \"{side}\"\ncapabilities = [\"net\"{extra}]\nexperimental = [\"net\"]\n");
++            let path = target.join(format!("{side}.hmod"));
++            std::fs::write(&path, Package::write(&manifest, &componentize(&core).unwrap()).unwrap()).unwrap();
++            paths.push(path);
++        }
++        (paths.remove(0), paths.remove(0))
++    })
++}
++
++fn player(id: &str) -> ServerPlayer {
++    ServerPlayer {
++        id: id.into(),
++        name: "Alex".into(),
++        x: 0.0,
++        y: 64.0,
++        z: 0.0,
++        dimension: "minecraft:overworld".into(),
++        health: 20.0,
++        game_mode: horizon_mods::GameMode::Survival,
++    }
++}
++fn snapshot() -> Snapshot {
++    Snapshot {
++        network_connected: true,
++        players: vec![player("authenticated-player")],
++        ..Default::default()
++    }
++}
++fn feedback(out: &[Output]) -> Option<&str> {
++    out.iter().find_map(|o| {
++        if let Output::Feedback { text, .. } = o {
++            Some(text.as_str())
++        } else {
++            None
++        }
++    })
++}
++fn client() -> Mods {
++    let mut mods = Mods::load_for(Runs::Client, &[guests().0.clone()], |_| true, |_| false);
++    assert_eq!(mods.entries()[0].status, Status::Running);
++    mods.set_snapshot(snapshot());
++    mods
++}
++
++#[test]
++fn real_components_route_by_mod_and_authenticated_sender() {
++    let mut client = client();
++    let mut server = Mods::load_for(Runs::Server, &[guests().1.clone()], |_| true, |_| false);
++    assert_eq!(server.entries()[0].status, Status::Running);
++    server.set_snapshot(snapshot());
++    assert!(!server.receive_network("other_mod", Some("authenticated-player"), b"secret"));
++    assert!(!server.receive_network("channel_test", None, b"wrong side"));
++    assert!(client.command("net_send hello"));
++    let out = client.drain();
++    let (id, data) = out
++        .iter()
++        .find_map(|o| match o {
++            Output::Network {
++                mod_id,
++                player: None,
++                data,
++                ..
++            } => Some((mod_id, data)),
++            _ => None,
++        })
++        .unwrap();
++    assert_eq!(id, "channel_test");
++    assert!(server.receive_network(id, Some("authenticated-player"), data));
++    server.server_tick(1);
++    let out = server.drain();
++    let (id, recipient, data) = out
++        .iter()
++        .find_map(|o| match o {
++            Output::Network {
++                mod_id,
++                player: Some(player),
++                data,
++                ..
++            } => Some((mod_id, player, data)),
++            _ => None,
++        })
++        .unwrap();
++    assert_eq!(recipient, "authenticated-player");
++    assert!(client.receive_network(id, None, data));
++    assert!(client.command("net_poll"));
++    assert_eq!(feedback(&client.drain()), Some("server:hello"));
++}
++
++#[test]
++fn client_cannot_forge_recipients_and_sends_have_hook_budgets() {
++    let mut client = client();
++    assert!(client.command("net_spoof hello"));
++    assert!(
++        !client
++            .drain()
++            .iter()
++            .any(|o| matches!(o, Output::Network { .. }))
++    );
++    client.command("net_burst");
++    let output = client.drain();
++    assert_eq!(feedback(&output), Some("limited"));
++    assert_eq!(
++        output
++            .iter()
++            .filter(|o| matches!(o, Output::Network { .. }))
++            .count(),
++        8
++    );
++    client.command("net_send next hook");
++    assert_eq!(
++        client
++            .drain()
++            .iter()
++            .filter(|o| matches!(o, Output::Network { .. }))
++            .count(),
++        1
++    );
++}
++
++#[test]
++fn reconnect_clears_queued_bytes_and_notifies_the_client() {
++    let mut client = client();
++    assert!(client.receive_network("channel_test", None, b"old-session"));
++    client.command("net_send old outgoing");
++    client.network_disconnected();
++    assert!(
++        !client
++            .drain()
++            .iter()
++            .any(|o| matches!(o, Output::Network { .. }))
++    );
++    client.command("net_poll");
++    assert_eq!(feedback(&client.drain()), Some("disconnected"));
++    client.command("net_send disconnected");
++    assert!(
++        !client
++            .drain()
++            .iter()
++            .any(|o| matches!(o, Output::Network { .. }))
++    );
++    client.set_snapshot(snapshot());
++    assert!(client.receive_network("channel_test", None, b"new-session"));
++    client.command("net_poll");
++    assert_eq!(feedback(&client.drain()), Some("server:new-session"));
++}
++
++#[test]
++fn trapping_hooks_cannot_send_partial_network_results() {
++    let mut client = client();
++    client.command("net_panic");
++    assert!(matches!(client.entries()[0].status, Status::Failed(_)));
++    assert!(
++        !client
++            .drain()
++            .iter()
++            .any(|o| matches!(o, Output::Network { .. }))
++    );
++}
++
++#[test]
++fn in_frame_can_load_both_halves_with_the_same_mod_id() {
++    let mut mods = Mods::load_for(
++        Runs::Both,
++        &[guests().0.clone(), guests().1.clone()],
++        |_| true,
++        |_| false,
++    );
++    assert!(mods.entries().iter().all(|e| e.status == Status::Running));
++    mods.set_snapshot(snapshot());
++    assert!(mods.receive_network("channel_test", Some("authenticated-player"), b"loopback"));
++    mods.server_tick(1);
++    let outputs = mods.drain();
++    for output in outputs {
++        if let Output::Network {
++            mod_id,
++            player: Some(_),
++            data,
++            ..
++        } = output
++        {
++            assert!(mods.receive_network(&mod_id, None, &data));
++        }
++    }
++    mods.command("net_poll");
++    assert_eq!(feedback(&mods.drain()), Some("server:loopback"));
++}
++
++#[test]
++fn offline_players_cannot_receive_or_replay_queued_messages() {
++    let mut server = Mods::load_for(Runs::Server, &[guests().1.clone()], |_| true, |_| false);
++    server.set_snapshot(snapshot());
++    assert!(server.receive_network("channel_test", Some("authenticated-player"), b"old"));
++    server.player_left(&player("authenticated-player"));
++    server.set_snapshot(Snapshot::default());
++    server.server_tick(1);
++    assert!(
++        !server
++            .drain()
++            .iter()
++            .any(|o| matches!(o, Output::Network { .. }))
++    );
++}
+diff --git a/crates/horizon-mods/tests/sandbox.rs b/crates/horizon-mods/tests/sandbox.rs
+index e400dd56b..1004b64d2 100644
+--- a/crates/horizon-mods/tests/sandbox.rs
++++ b/crates/horizon-mods/tests/sandbox.rs
+@@ -205,7 +205,7 @@ fn undeclared_capabilities_are_refused() {
+ /// from the functions they import.
+ #[test]
+ fn a_mod_for_a_newer_horizon_is_refused() {
+-    use horizon_mods::api_level::{LEVEL, imports, needed};
++    use horizon_mods::api_level::{imports, level_of, needed};
+     use wit_parser::{ManglingAndAbi, Resolve};
+     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+     let wit = std::fs::read_to_string(root.join("crates/horizon-mod-sdk/wit/horizon.wit"))
+@@ -241,8 +241,8 @@ id = "too_new"
+ name = "Too New"
+ version = "0.1.0"
+ api = "0.1"
+-capabilities = ["game-read", "chat", "hud", "storage", "command", "ui", "render", "input", "recipes"]
+-experimental = ["ui", "render", "input", "recipes"]
++capabilities = ["game-read", "chat", "hud", "storage", "command", "ui", "render", "input", "recipes", "net"]
++experimental = ["ui", "render", "input", "recipes", "net"]
+ "#;
+     std::fs::write(dir.join("horizon-mod.toml"), manifest).unwrap();
+     std::fs::write(dir.join("mod.wasm"), wasm).unwrap();
+@@ -256,7 +256,10 @@ experimental = ["ui", "render", "input", "recipes"]
+     };
+     assert_eq!(level("coords_hud.hmod"), 0);
+     // The UI guest draws far terrain (`render.set-far-terrain`).
+-    assert_eq!(level("horizon_mods_test_ui_guest.hmod"), LEVEL);
++    assert_eq!(
++        level("horizon_mods_test_ui_guest.hmod"),
++        level_of("render.set-far-terrain").unwrap()
++    );
+ }
+ 
+ #[test]
+diff --git a/crates/horizon-protocol/src/lib.rs b/crates/horizon-protocol/src/lib.rs
+index 299688560..de5cca665 100644
+--- a/crates/horizon-protocol/src/lib.rs
++++ b/crates/horizon-protocol/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod entity_data;
+ pub mod frame;
+ pub mod ids;
+ pub mod item;
++pub mod mod_channel;
+ pub mod packets;
+ pub mod quiet;
+ pub mod registry;
+diff --git a/crates/horizon-protocol/src/mod_channel.rs b/crates/horizon-protocol/src/mod_channel.rs
+new file mode 100644
+index 000000000..10c9ee799
+--- /dev/null
++++ b/crates/horizon-protocol/src/mod_channel.rs
+@@ -0,0 +1,84 @@
++//! Opt-in Horizon mod traffic inside vanilla's custom-payload packet.
++//! The authenticated connection supplies the player; the envelope names only
++//! the destination mod. This protocol never carries a claimed sender identity.
++use crate::{
++    Error, Result,
++    buf::{Reader, Writer},
++};
++
++pub const CHANNEL: &str = "horizon:mod";
++pub const MAX_DATA: usize = 16 * 1024;
++const VERSION: u8 = 1;
++const MAX_ID: usize = 64;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Message {
++    pub mod_id: String,
++    pub data: Vec<u8>,
++}
++
++fn valid_id(id: &str) -> bool {
++    !id.is_empty()
++        && id.len() <= MAX_ID
++        && id
++            .bytes()
++            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
++}
++
++pub fn encode(mod_id: &str, data: &[u8]) -> Result<Vec<u8>> {
++    if !valid_id(mod_id) || data.len() > MAX_DATA {
++        return Err(Error::new("mod channel: invalid id or oversized data"));
++    }
++    let mut writer = Writer::new();
++    writer.u8(VERSION);
++    writer.string(mod_id);
++    writer.data.extend_from_slice(data);
++    Ok(writer.data)
++}
++
++pub fn decode(data: &[u8]) -> Result<Message> {
++    if data.len() > MAX_DATA + MAX_ID + 2 {
++        return Err(Error::new("mod channel: oversized payload"));
++    }
++    let mut reader = Reader::new(data);
++    if reader.u8()? != VERSION {
++        return Err(Error::new("mod channel: unsupported version"));
++    }
++    let mod_id = reader.string(MAX_ID)?;
++    if !valid_id(&mod_id) || reader.remaining() > MAX_DATA {
++        return Err(Error::new("mod channel: invalid id or oversized data"));
++    }
++    // The remainder is one opaque payload, so no attacker-controlled allocation count.
++    let offset = data.len() - reader.remaining();
++    Ok(Message {
++        mod_id,
++        data: data[offset..].to_vec(),
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn boundary_payload_round_trips_without_a_sender_field() {
++        let bytes = vec![42; MAX_DATA];
++        assert_eq!(
++            decode(&encode("superbwarfare", &bytes).unwrap()).unwrap(),
++            Message {
++                mod_id: "superbwarfare".into(),
++                data: bytes
++            }
++        );
++    }
++    #[test]
++    fn malformed_ids_versions_and_sizes_are_rejected() {
++        for id in ["", "a:b", "../x", "Upper", &"a".repeat(65)] {
++            assert!(encode(id, &[]).is_err());
++        }
++        assert!(encode("a", &vec![0; MAX_DATA + 1]).is_err());
++        assert!(decode(&[]).is_err());
++        assert!(decode(&[2, 1, b'a']).is_err());
++        assert!(decode(&[1, 64, b'a']).is_err());
++        assert!(decode(&vec![0; MAX_DATA + MAX_ID + 3]).is_err());
++    }
++}
+diff --git a/docs/api/mods-reference.md b/docs/api/mods-reference.md
+index b25ef5b9e..fb3a4d1f5 100644
+--- a/docs/api/mods-reference.md
++++ b/docs/api/mods-reference.md
+@@ -19,26 +19,27 @@ The contract between Horizon and its mods: the WIT package `horizon:mods@0.1.0`,
+ | `players` | [`players`](#players) | see who is on the server and message them |
+ | `world` | [`world`](#world) | read and change the world's blocks |
+ | `recipes` | [`recipes`](#recipes) | read the game's recipes and items and which recipes you know, place recipes in your crafting grid and, in creative mode, give you items |
++| `net` | [`net`](#net) | exchange data with its matching component on the game server or clients |
+ 
+ ## World `horizon-mod`
+ 
+ A client mod: runs in the player's game.
+ 
+-- Imports (what the game offers): `log`, `game`, `chat`, `hud`, `storage`, `command`
++- Imports (what the game offers): `log`, `game`, `chat`, `hud`, `storage`, `command`, `net`
+ - Exports (what the mod provides): `events`
+ 
+ ## World `horizon-server-mod`
+ 
+ A server mod (manifest `side = "server"`, `api = "0.3"`, experimental): runs where the world is simulated, on the dedicated server, a LAN host and single player's own server.
+ 
+-- Imports (what the game offers): `log`, `storage`, `players`, `world`
++- Imports (what the game offers): `log`, `storage`, `players`, `world`, `net`
+ - Exports (what the mod provides): `server-events`
+ 
+ ## World `horizon-ui-mod`
+ 
+ A mod with widgets (capability `ui`): the SDK builds every mod against this world. Mods built for `horizon-mod` alone (no `ui-events` export) still load and simply hear nothing of their widgets.
+ 
+-- Imports (what the game offers): `ui`, `render`, `input`, `recipes`, `browser`, `log`, `game`, `chat`, `hud`, `storage`, `command`
++- Imports (what the game offers): `ui`, `render`, `input`, `recipes`, `browser`, `log`, `game`, `chat`, `hud`, `storage`, `command`, `net`
+ - Exports (what the mod provides): `ui-events`, `events`
+ 
+ ## World `ui-host`
+@@ -768,3 +769,40 @@ An argument's value, parsed as its kind says.
+ | `command` | `func(player: player, name: string, args: string, values: list<tuple<string, argument-value>>) -> result<option<string>, string>` | `/name args` typed by `player`: ok(some(text)) is their feedback, err(text) their error in red. `values` holds each argument given, by name, in order (an optional one left out isn't there); a line that doesn't parse never reaches the mod: the player gets vanilla's error. |
+ | `block-broken` | `func(player: player, pos: block-pos, state: string)` | A player broke the block at `pos` in their dimension: `state` is what was there, as `minecraft:oak_log[axis=y]`. |
+ | `block-placed` | `func(player: player, pos: block-pos, state: string)` | A player placed `state` at `pos` in their dimension. |
++
++## `net`
++
++Access: capability `net`.
++
++Capability `net` (experimental): a connection-scoped channel between the client and server components with the SAME mod id. Never an internet socket.
++
++### record `session`
++
++Opaque host-generated connection token, not a player identity or permission.
++
++| Field | Type | |
++| --- | --- | --- |
++| `high` | `u64` |  |
++| `low` | `u64` |  |
++
++### record `message`
++
++| Field | Type | |
++| --- | --- | --- |
++| `player` | `option<string>` | On the server, the authenticated sender's UUID. On the client, none. |
++| `session` | `option<session>` | Server only: host token captured at enqueue time. Compare with session-token if retaining a message across ticks/reconnections. |
++| `data` | `list<u8>` |  |
++
++### variant `event`
++
++| Case | Payload | |
++| --- | --- | --- |
++| `received` | `message` |  |
++| `disconnected` |  | Client connection ended or changed. Discard old session/prediction. |
++
++| Function | Signature | What it does |
++| --- | --- | --- |
++| `connected` | `func() -> bool` | Client: the server announced channel support. Server: false (use the online players instead). No channel is available on a vanilla server. |
++| `session-token` | `func(player: string) -> option<session>` | Server only: fresh token for this player's current authenticated connection, available after its first received message. None elsewhere. |
++| `send` | `func(player: option<string>, data: list<u8>) -> result<_, string>` | Client: player must be none, sends to its server. Server: player must name an online player's UUID. Host supplies the sending mod id and authenticates players; bytes never select their sender. At most 16 KiB per message and 8 messages per hook. An error queues nothing. |
++| `poll` | `func() -> list<event>` | Events in arrival order. Bounded to 64 events / 256 KiB; no polling does not grant unbounded memory. Disconnect clears old queued messages. |
+diff --git a/docs/api/mods.md b/docs/api/mods.md
+index 0dc74e7a3..a43b11cb1 100644
+--- a/docs/api/mods.md
++++ b/docs/api/mods.md
+@@ -97,7 +97,7 @@ What real mods need next, in the order modpacks and servers need it:
+ - **Entities**: query and change entities near a position; spawn from a mod's own entity types (data first).
+ - **Block entities and menus**: ticking machines with slots and their screens.
+ - **Screens and UI**: widgets built from vanilla's, a screen the mod owns, a settings page under Options > Mods.
+-- **Networking**: a channel between a mod's two halves, client and server, typed by the mod's own WIT.
++- **Networking**: experimental `net` now carries bounded bytes between same-id client/server components, with authenticated sender identities and connection tokens. Typed application protocols sit above it.
+ - **Config**: typed settings the game shows and stores for the mod, on the server too.
+ - **Keys and the crosshair target**: keybinds in Controls; what the player is looking at.
+ - **Script mods and other languages**: see [Ways in](#ways-in).
+diff --git a/docs/api/stability.md b/docs/api/stability.md
+index 765034b3d..28681eab6 100644
+--- a/docs/api/stability.md
++++ b/docs/api/stability.md
+@@ -38,7 +38,7 @@ don't import it); faster, or fixing behaviour to what the reference already says
+ 
+ A new WIT function doesn't break older mods, but a mod that calls it can't run on a Horizon from before it. So every
+ function the game offers mods has an **API level**, the one it arrived at (`crates/horizon-mods/src/api_level.rs`):
+-level 0 is the contract of Horizon 0.2.67 to 0.2.69, level 1 adds `render.set-minimap` and server mods' `players`, level 2 `game.raycast`, level 3 `command.run-quiet`, level 4 server mods' `world`, level 5 `recipes` (`items`, `all`, `known`), level 6 `browser` (`set-items`, `poll`, `set-recipes`) and `recipes.place` and `recipes.give`, level 7 `render.set-far-terrain`. A mod needs the level of
++level 0 is the contract of Horizon 0.2.67 to 0.2.69, level 1 adds `render.set-minimap` and server mods' `players`, level 2 `game.raycast`, level 3 `command.run-quiet`, level 4 server mods' `world`, level 5 `recipes` (`items`, `all`, `known`), level 6 `browser` (`set-items`, `poll`, `set-recipes`) and `recipes.place` and `recipes.give`, level 7 `render.set-far-terrain`, and level 8 the experimental `net` channel. A mod needs the level of
+ the newest function it imports (a component imports only the functions it calls). The level is read from the file,
+ never declared:
+ 
+diff --git a/docs/mods.md b/docs/mods.md
+index aad279866..68cd1d701 100644
+--- a/docs/mods.md
++++ b/docs/mods.md
+@@ -121,10 +121,40 @@ loading. Ordered by what the first native ports need:
+ | `render` (world) | world-space lines, boxes and billboards, beside the HUD shapes `render` has | Litematica-style placement, waypoints |
+ | `registries` | new blocks, items, entities and recipes, mostly data: JSON models, textures, loot and recipes in the `.hmod`'s `assets/` and `data/` | server side; see [Multiplayer](#multiplayer) |
+ | `server` | world events (entity spawn/death), game rules, world read/write, typed server commands | after [server mods 0.3](#server-mods-api-03-experimental)'s players, chat, blocks and commands |
+-| `net` | a mod's own client↔server channel (custom payloads) | only between the two halves of the same mod |
++| `net` | implemented experimentally: a mod's own client↔server channel | only between components with the same mod id; see below |
+ 
+ There is no file, socket, process or raw-input interface, on purpose.
+ 
++### Mod channels (experimental, API level 8)
++
++`capabilities = ["net"]` and `experimental = ["net"]` enable a private channel
++between a client and server component with the same mod id. The Rust SDK exposes
++`net` on both sides. `connected()` reports server support to the client;
++`send(None, bytes)` sends to its server, while a server uses
++`send(Some(player_uuid), bytes)`. Server manifests still declare `players` for
++the player types in their exported callbacks.
++
++`poll()` returns `received` and client `disconnected` events. Received server
++messages include the authenticated player's UUID and a host-generated session
++token; clients cannot choose either. `session-token(player)` gives the current
++token on the server. If a mod queues messages itself, compare the captured token
++against this value before handling them. Reconnecting with the same player UUID
++rotates the token. The transport binds queued replies to the actual connection
++generation so a late reply cannot reach a replacement connection.
++
++The game uses `horizon:mod` custom payloads over the existing connection. Nothing
++is sent on a vanilla server. In-frame single player uses the same inboxes as a
++loopback; the integrated server, LAN and dedicated server use the normal packet
++handlers. Separate client/server `.hmod` files may share an id; two running
++components on the same side may not. Only one package should own any content
++namespace.
++
++Messages are at most 16 KiB, each hook can send 8, and each inbox holds at most
++64 events / 256 KiB. Full inboxes refuse new messages. Mods need acknowledgements
++and application limits appropriate to their gameplay. Disconnect removes stale
++traffic; a trapped hook's network outputs are discarded. This capability grants
++no sockets, world writes, inventory access or damage authority.
++
+ ## Choosing the runtime
+ 
+ | Option | Sandbox | One file for all OSes | Typed API | Cost | Verdict |

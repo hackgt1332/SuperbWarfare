@@ -148,3 +148,4 @@ bin/
 
 # Rust port build output
 /rust/target/
+/rust/horizon-bridge/target/

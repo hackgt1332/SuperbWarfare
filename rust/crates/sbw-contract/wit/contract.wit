@@ -1,6 +1,6 @@
 /// A proposed adapter contract, NOT an API already implemented by Horizon.
 /// WIT versions, wire versions and save versions are independent (README.md).
-package superbwarfare:contract@0.1.0;
+package superbwarfare:contract@0.2.0;
 
 interface types {
     /// Persistent UUID bits, high half then low half. Zero is invalid.
@@ -207,6 +207,9 @@ interface server-host {
     use types.{uuid, player, inventory, inventory-edit, server-packet, sweep, hit,
         entity-record, entity-key, transform, damage-request, host-error};
     get-player: func(id: uuid) -> option<player>;
+    /// A fresh host-generated token for this authenticated connection, available
+    /// before processing its Hello. Never mint a token from guest clock/state.
+    session-token: func(player: uuid) -> option<uuid>;
     get-inventory: func(player: uuid) -> result<inventory, host-error>;
     /// Compare-and-exchange for the WHOLE inventory. All writes or none;
     /// advances revision once. Used for gun state + ammo consumption together.

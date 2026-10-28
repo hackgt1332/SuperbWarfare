@@ -1,7 +1,7 @@
 # SuperbWarfare Rust contract
 
 This workspace starts the Horizon port with a buildable contract, before gameplay.
-The component ABI is `superbwarfare:contract@0.1.0` in
+The component ABI is `superbwarfare:contract@0.2.0` in
 [`contract.wit`](crates/sbw-contract/wit/contract.wit). Rust data types, client imports,
 server imports and guest export traits are generated from that file. There is no
 second handwritten representation of the same messages.
@@ -11,6 +11,13 @@ second handwritten representation of the same messages.
 playable `.hmod` and does not change either game's behavior. The reference mod is
 SuperbWarfare `d7b608fa9692d4373d5f9875c276eb871130e37d` (Forge 1.20.1); the target
 engine is Horizon's Minecraft 26.3 implementation.
+
+The first executable adapter is now in [`horizon-bridge`](horizon-bridge/README.md).
+It uses Horizon's existing component worlds plus an experimental `net`
+capability to carry this contract's packet protocol. The full custom worlds
+remain proposed: item transactions, entities, damage and rendering are not
+implemented by this transport adapter. ABI 0.2 adds a server host session-token
+accessor; the packet protocol and wire bytes remain 0.1 / format 1.
 
 ## Build and verify
 
@@ -179,7 +186,7 @@ confirmation; only authoritative state/effects establish what happened.
 
 ## Versions, units and bounds
 
-The WIT package version (`0.1.0`), gameplay protocol (`0.1`), wire format (`1`),
+The WIT package version (`0.2.0`), gameplay protocol (`0.1`), wire format (`1`),
 opaque-state schema and future Horizon manifest API are independent. Do not claim
 that a `0.3` Horizon manifest can load this contract. Pre-1.0 protocol versions
 must match exactly. A wire shape, field order or enum order change needs a new
@@ -221,8 +228,8 @@ future schema. Unsupported schemas are rejected before loading/mutating state.
 
 ## Next integration step
 
-Implement a Horizon host adapter for these two worlds, authenticated channel
-routing, item claims and inventory transactions. Then wire a single AK-47 through
+The authenticated channel and session bridge is implemented in `horizon-bridge`.
+Implement item claims and inventory transactions next, then wire a single AK-47 through
 intent -> authoritative simulation -> paged snapshot/effects. Preserve the
 standalone tests and add real integrated-server/LAN/dedicated-server checks when
 the adapter exists. No Java compatibility bridge or asset redistribution is needed

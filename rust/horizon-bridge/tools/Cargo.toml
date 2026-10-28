@@ -1,0 +1,16 @@
+[package]
+name = "sbw-horizon-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+horizon-mods.workspace = true
+sbw-contract.workspace = true
+
+[dev-dependencies]
+horizon-mods = { workspace = true, features = ["runtime"] }
+
+[lints]
+workspace = true

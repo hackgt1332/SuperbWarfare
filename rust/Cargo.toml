@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/sbw-contract"]
+exclude = ["horizon-bridge"]
 resolver = "2"
 
 [workspace.package]
