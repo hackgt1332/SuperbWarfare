@@ -1,0 +1,251 @@
+/// A proposed adapter contract, NOT an API already implemented by Horizon.
+/// WIT versions, wire versions and save versions are independent (README.md).
+package superbwarfare:contract@0.1.0;
+
+interface types {
+    /// Persistent UUID bits, high half then low half. Zero is invalid.
+    record uuid { high: u64, low: u64 }
+    record version { major: u16, minor: u16 }
+    record vec3 { x: f64, y: f64, z: f64 }
+    record rotation { x: f32, y: f32, z: f32, w: f32 }
+    /// Positions and velocities are blocks and blocks per 20 Hz game tick.
+    record transform { position: vec3, orientation: rotation, velocity: vec3 }
+    /// Runtime handle scoped to a world session; generation prevents reuse.
+    record entity-key { index: u64, generation: u32 }
+    enum feature {
+        item-state, attack-input, mod-channel, entities, collision, damage,
+        world-models, world-persistence, vehicles,
+    }
+    record hello {
+        protocol: version,
+        /// Exactly 32 SHA-256 bytes; covers authoritative definitions and scripts.
+        content-sha256: list<u8>,
+        features: list<feature>,
+    }
+    record welcome {
+        protocol: version,
+        /// A fresh, nonzero, host-generated token for this player connection.
+        session: uuid,
+        server-tick: u64,
+        tick-rate: u16,
+        content-sha256: list<u8>,
+        required-features: list<feature>,
+    }
+    enum reject-reason {
+        incompatible-version, content-mismatch, missing-feature, not-ready,
+        wrong-session, replayed-input, invalid-input, stale-target,
+        not-authorized, rate-limited,
+    }
+    record rejection {
+        /// None for a handshake rejection; otherwise the rejected input sequence.
+        sequence: option<u64>,
+        reason: reject-reason,
+    }
+    record weapon-ref {
+        instance: uuid,
+        /// Player hotbar slot, 0..8. Never a registry ID or a client-chosen owner.
+        slot: u8,
+        /// Host increments when selected slot/instance changes, including A -> B -> A.
+        /// Changing ammunition alone does not change this revision.
+        equip-revision: u64,
+    }
+    enum weapon-action {
+        trigger-press, trigger-release, reload, cancel-reload,
+        cycle-fire-mode, aim-start, aim-stop,
+    }
+    record weapon-input { target: weapon-ref, action: weapon-action }
+    record vehicle-controls {
+        /// All axes finite and within [-1, 1]. Server validates seat ownership.
+        throttle: f32, strafe: f32, lift: f32, yaw: f32, pitch: f32, roll: f32,
+    }
+    variant vehicle-action {
+        controls(vehicle-controls), change-seat(u16), dismount,
+    }
+    record vehicle-input { target: entity-key, seat: u16, action: vehicle-action }
+    variant intent { weapon(weapon-input), vehicle(vehicle-input) }
+    record input {
+        session: uuid,
+        /// Starts at 1, strictly increasing, never wraps, scoped to session.
+        sequence: u64,
+        /// Advisory only. Damage, charge duration and fire cadence use server time.
+        client-tick: u64,
+        intent: intent,
+    }
+    /// No claimed player, hit result, damage, position or charge power is accepted.
+    variant client-packet { hello(hello), input(input) }
+
+    enum reload-phase { idle, preparing, loading, finishing, bolting }
+    record weapon-state {
+        target: weapon-ref,
+        revision: u64,
+        definition: string,
+        magazine: u32,
+        chambered: bool,
+        reserve: u32,
+        heat: f32,
+        fire-mode: u16,
+        reload: reload-phase,
+        /// Animation deadline in authoritative ticks, zero if idle.
+        phase-end-tick: u64,
+        trigger-held: bool,
+        aiming: bool,
+    }
+    /// The host saves this with the entity; opaque state belongs to sbw-sim.
+    /// This is NOT the Forge NBT format. Schema zero is invalid.
+    record entity-record {
+        instance: uuid,
+        definition: string,
+        dimension: string,
+        pose: transform,
+        state-schema: u16,
+        state: list<u8>,
+    }
+    record entity-state { key: entity-key, revision: u64, entity: entity-record }
+    /// Full replacement of this player's tracked set, not a delta. Missing
+    /// entities despawn locally; stale ticks are discarded. Includes initial join.
+    record snapshot {
+        session: uuid,
+        server-tick: u64,
+        /// Last processed input, including gameplay-rejected inputs; not proof
+        /// that a shot happened. The host calls the replay gate before gameplay.
+        acknowledged-input: option<u64>,
+        weapons: list<weapon-state>,
+        entities: list<entity-state>,
+    }
+    /// Bounded transport page of one full snapshot. Apply ONLY after every
+    /// page arrives and the merged snapshot passes validation. Never clear the
+    /// visible entity set on receipt of just one page. A newer tick supersedes
+    /// an incomplete older one. All pages have identical tick/session/ack.
+    record snapshot-page {
+        session: uuid,
+        server-tick: u64,
+        acknowledged-input: option<u64>,
+        page: u16,
+        pages: u16,
+        weapons: list<weapon-state>,
+        entities: list<entity-state>,
+    }
+    enum effect-kind { shot, impact, explosion, sound }
+    record effect {
+        /// Strictly increasing per recipient session, for presentation deduplication.
+        id: u64,
+        kind: effect-kind,
+        /// Registered presentation resource, not a path or executable code.
+        resource-id: string,
+        dimension: string,
+        position: vec3,
+        direction: vec3,
+        source: option<entity-key>,
+    }
+    record effects { session: uuid, server-tick: u64, events: list<effect> }
+    variant server-packet {
+        welcome(welcome), rejected(rejection), snapshot(snapshot-page), effects(effects),
+    }
+
+    enum host-error {
+        unsupported, invalid-argument, not-found, stale-revision,
+        not-authorized, limit-exceeded, unavailable,
+    }
+    /// Server-generated stack identity. State is a versioned mod component.
+    record stack {
+        instance: uuid, item: string, count: u32, state-schema: u16, state: list<u8>,
+    }
+    record slot { index: u16, value: option<stack> }
+    record inventory { revision: u64, slots: list<slot> }
+    record inventory-edit {
+        expected-revision: u64,
+        /// Unique slot indices; validate every write before changing any slot.
+        writes: list<slot>,
+    }
+    record player {
+        id: uuid,
+        /// Runtime player handle, e.g. to exclude the shooter from a sweep.
+        entity: entity-key,
+        dimension: string, position: vec3,
+        yaw: f32, pitch: f32, spectator: bool,
+        /// Server-owned selection, matching weapon-ref in replicated/local input.
+        selected-slot: u8, equip-revision: u64,
+    }
+    record sweep {
+        dimension: string, start: vec3, end: vec3, radius: f32,
+        ignored: list<entity-key>,
+    }
+    record block-pos { x: s32, y: s32, z: s32 }
+    variant hit-target { block(block-pos), entity(entity-key) }
+    record hit {
+        target: hit-target, position: vec3, normal: vec3,
+        /// Fraction of the sweep, [0, 1]; hits ordered closest first.
+        fraction: f64,
+    }
+    record damage-request {
+        target: entity-key, source: uuid, damage-type: string, amount: f32,
+    }
+    enum input-kind { attack-press, attack-release, use-press, use-release, reload }
+    record local-input { tick: u64, target: weapon-ref, kind: input-kind }
+    record held-model {
+        instance: uuid, model: string, animation: string,
+        animation-seconds: f32, aim-fraction: f32,
+    }
+}
+
+/// Additional CLIENT capabilities required from a future Horizon adapter.
+/// Existing Horizon HUD/log/settings interfaces remain separate.
+interface client-host {
+    use types.{client-packet, host-error, held-model, effect};
+    /// Claims attack AND use only while holding these items. Claims suppress
+    /// vanilla attack/use before it runs. Unload/disconnect/screens release keys.
+    claim-items: func(items: list<string>) -> result<_, host-error>;
+    /// Reliable ordered channel to this connection's server, never an arbitrary peer.
+    send: func(packet: client-packet) -> result<_, host-error>;
+    /// Host owns GPU resources, animation decoding, interpolation and render timing.
+    set-held-model: func(model: option<held-model>) -> result<_, host-error>;
+    present: func(events: list<effect>) -> result<_, host-error>;
+}
+
+/// SERVER only. The host derives the caller's mod identity from its Store.
+interface server-host {
+    use types.{uuid, player, inventory, inventory-edit, server-packet, sweep, hit,
+        entity-record, entity-key, transform, damage-request, host-error};
+    get-player: func(id: uuid) -> option<player>;
+    get-inventory: func(player: uuid) -> result<inventory, host-error>;
+    /// Compare-and-exchange for the WHOLE inventory. All writes or none;
+    /// advances revision once. Used for gun state + ammo consumption together.
+    commit-inventory: func(player: uuid, edit: inventory-edit) -> result<u64, host-error>;
+    send: func(player: uuid, packet: server-packet) -> result<_, host-error>;
+    /// Loaded chunks only, no implicit generation; at most 64 hits.
+    sweep-world: func(query: sweep) -> result<list<hit>, host-error>;
+    /// Host allocates runtime handle; duplicate persistent UUIDs are rejected.
+    spawn: func(entity: entity-record) -> result<entity-key, host-error>;
+    update-entity: func(key: entity-key, pose: transform, schema: u16, state: list<u8>) -> result<_, host-error>;
+    despawn: func(key: entity-key) -> result<_, host-error>;
+    /// Host applies vanilla damage rules; guest never mutates arbitrary health.
+    damage: func(request: damage-request) -> result<_, host-error>;
+}
+
+interface client-events {
+    use types.{server-packet, local-input};
+    init: func() -> result<_, string>;
+    input: func(event: local-input);
+    receive: func(packet: server-packet);
+    tick: func(tick: u64);
+    /// Clear session, predicted actions, held model and all tracked entities.
+    disconnected: func();
+}
+
+interface server-events {
+    use types.{uuid, client-packet, entity-key, entity-record};
+    init: func() -> result<_, string>;
+    /// Actor is authenticated by the HOST, never taken from packet contents.
+    receive: func(player: uuid, packet: client-packet);
+    left: func(player: uuid);
+    tick: func(tick: u64);
+    /// Host restores persistence and allocates handles before simulation resumes.
+    entity-loaded: func(key: entity-key, entity: entity-record);
+    /// Unload is not death: clear runtime state but retain the saved record.
+    entity-unloaded: func(key: entity-key);
+}
+
+/// Native protocol types are generated from this same interface.
+world schema { import types; }
+world client { import client-host; export client-events; }
+world server { import server-host; export server-events; }

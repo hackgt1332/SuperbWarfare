@@ -145,3 +145,6 @@ bin/
 .mc-mcp-cache/
 .mc-mcp-cache-test/
 /.claude/
+
+# Rust port build output
+/rust/target/
