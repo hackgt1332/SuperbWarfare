@@ -42,3 +42,9 @@ QQ群: 460300219
 
 
 [Discord](https://discord.gg/g7RVnHFDh9)
+
+## Horizon Rust port
+
+The experimental Rust/WASM port includes AK-47/Glock 17 gameplay and pickup/truck
+prototypes for the patched Horizon engine. See [build instructions, controls and
+current limits](rust/horizon-bridge/README.md).

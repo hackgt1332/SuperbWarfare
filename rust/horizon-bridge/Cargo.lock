@@ -781,6 +781,8 @@ version = "0.1.0"
 dependencies = [
  "horizon-mod-sdk",
  "sbw-contract",
+ "sbw-sim",
+ "serde_json",
 ]
 
 [[package]]
@@ -789,6 +791,8 @@ version = "0.1.0"
 dependencies = [
  "horizon-mod-sdk",
  "sbw-contract",
+ "sbw-sim",
+ "serde_json",
 ]
 
 [[package]]
@@ -797,6 +801,18 @@ version = "0.1.0"
 dependencies = [
  "horizon-mods",
  "sbw-contract",
+ "sbw-sim",
+]
+
+[[package]]
+name = "sbw-sim"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "sbw-contract",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

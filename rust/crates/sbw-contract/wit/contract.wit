@@ -1,6 +1,6 @@
 /// A proposed adapter contract, NOT an API already implemented by Horizon.
 /// WIT versions, wire versions and save versions are independent (README.md).
-package superbwarfare:contract@0.2.0;
+package superbwarfare:contract@0.3.0;
 
 interface types {
     /// Persistent UUID bits, high half then low half. Zero is invalid.
@@ -62,7 +62,7 @@ interface types {
         controls(vehicle-controls), change-seat(u16), dismount,
     }
     record vehicle-input { target: entity-key, seat: u16, action: vehicle-action }
-    variant intent { weapon(weapon-input), vehicle(vehicle-input) }
+    variant intent { weapon(weapon-input), vehicle(vehicle-input), deploy-vehicle(u8) }
     record input {
         session: uuid,
         /// Starts at 1, strictly increasing, never wraps, scoped to session.

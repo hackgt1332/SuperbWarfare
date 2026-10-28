@@ -27,7 +27,7 @@ pub mod client {
         pub_export_macro: true,
         export_macro_name: "export_client",
         default_bindings_module: "sbw_contract::client",
-        with: { "superbwarfare:contract/types@0.2.0": crate::types },
+        with: { "superbwarfare:contract/types@0.3.0": crate::types },
         generate_all,
     });
 }
@@ -41,7 +41,7 @@ pub mod server {
         pub_export_macro: true,
         export_macro_name: "export_server",
         default_bindings_module: "sbw_contract::server",
-        with: { "superbwarfare:contract/types@0.2.0": crate::types },
+        with: { "superbwarfare:contract/types@0.3.0": crate::types },
         generate_all,
     });
 }
@@ -56,7 +56,7 @@ pub mod session;
 pub mod validate;
 pub mod wire;
 
-pub const PROTOCOL: types::Version = types::Version { major: 0, minor: 1 };
+pub const PROTOCOL: types::Version = types::Version { major: 0, minor: 2 };
 pub const TICK_RATE: u16 = 20;
 
 /// Minimum host support for the first playable firearm, before optional vehicles.

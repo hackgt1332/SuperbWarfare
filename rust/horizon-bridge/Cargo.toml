@@ -9,6 +9,8 @@ rust-version = "1.95"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
+sbw-sim = { path = "../crates/sbw-sim" }
+serde_json = "1"
 sbw-contract = { path = "../crates/sbw-contract" }
 # Development adapter: the patched Horizon checkout is a sibling of this repo.
 horizon-mod-sdk = { path = "../../../horizon/crates/horizon-mod-sdk" }

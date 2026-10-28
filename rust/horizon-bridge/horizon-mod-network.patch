@@ -11,30 +11,34 @@ index f048c88d2..8e57d7b33 100644
   "log",
   "minisign-verify",
 diff --git a/crates/cargo-horizon-mod/src/check.rs b/crates/cargo-horizon-mod/src/check.rs
-index 988ba826d..3413ce77e 100644
+index 988ba826d..c53b99932 100644
 --- a/crates/cargo-horizon-mod/src/check.rs
 +++ b/crates/cargo-horizon-mod/src/check.rs
-@@ -265,6 +265,7 @@ fn play(path: &Path, report: &mut Report) -> Result<(), String> {
+@@ -265,6 +265,9 @@ fn play(path: &Path, report: &mut Report) -> Result<(), String> {
              Output::QuietCommands { lines, .. } => {
                  format!("{} quiet command(s)", lines.len())
              }
++            Output::Gameplay { .. } => "queued gameplay edit".into(),
++            Output::VehicleModels { .. } => "bound vehicle models".into(),
 +            Output::Network { data, .. } => format!("queued {} network byte(s)", data.len()),
              Output::Stopped { reason, .. } => return Err(format!("it stopped: {reason}")),
              Output::SetBlocks {
                  dimension, blocks, ..
 diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
-index c97af3a47..0e0127765 100644
+index c97af3a47..53c1e46d4 100644
 --- a/crates/horizon-client/src/game.rs
 +++ b/crates/horizon-client/src/game.rs
-@@ -112,6 +112,7 @@ mod mod_browser;
+@@ -111,7 +111,9 @@ mod mob_sounds;
+ mod mod_browser;
  #[cfg(feature = "mods")]
  mod mod_browser_recipes;
++mod mod_gameplay;
  mod mod_input;
 +mod mod_network;
  #[cfg(feature = "mods")]
  mod mod_recipes;
  mod mod_render;
-@@ -9358,6 +9359,13 @@ impl Game<'_> {
+@@ -9358,6 +9360,13 @@ impl Game<'_> {
          Ok(())
      }
      fn close_world(&mut self) -> Result<()> {
@@ -48,6 +52,305 @@ index c97af3a47..0e0127765 100644
          self.clear_waypoints();
          self.begin_closing_save(false)
      }
+diff --git a/crates/horizon-client/src/game/boats.rs b/crates/horizon-client/src/game/boats.rs
+index 7e80f6f58..24a3e5f84 100644
+--- a/crates/horizon-client/src/game/boats.rs
++++ b/crates/horizon-client/src/game/boats.rs
+@@ -27,6 +27,7 @@ pub(super) enum Status {
+ #[derive(Clone, Debug)]
+ pub(super) struct Boat {
+     pub id: u32,
++    pub mod_vehicle: Option<horizon_client::mod_vehicle::ModVehicle>,
+     /// Wood type (`oak`, `bamboo` for the raft).
+     pub wood: Arc<str>,
+     pub position: Vec3,
+@@ -60,6 +61,7 @@ impl Boat {
+     pub fn new(id: u32, wood: Arc<str>, position: Vec3, yaw: f32) -> Self {
+         Self {
+             id,
++            mod_vehicle: None,
+             wood,
+             position,
+             previous: position,
+@@ -90,6 +92,17 @@ impl Boat {
+         self
+     }
+     pub fn bounds(&self) -> Aabb {
++        if let Some(v) = &self.mod_vehicle {
++            let q = &v.profile;
++            let (sin, cos) = f64::from(self.yaw).to_radians().sin_cos();
++            let w = (q.width * cos.abs() + q.length * sin.abs()) / 2.;
++            let l = (q.length * cos.abs() + q.width * sin.abs()) / 2.;
++            let p = self.position;
++            return Aabb::new(
++                Vec3::new(p.x - w, p.y, p.z - l),
++                Vec3::new(p.x + w, p.y + q.height, p.z + l),
++            );
++        }
+         let (w, p) = (WIDTH / 2.0, self.position);
+         Aabb::new(
+             Vec3::new(p.x - w, p.y, p.z - w),
+@@ -103,10 +116,17 @@ impl Boat {
+     }
+     /// `getMaxPassengers`: two, one beside a chest.
+     pub fn max_passengers(&self) -> usize {
+-        if self.chest { 1 } else { 2 }
++        if self.chest || self.mod_vehicle.is_some() {
++            1
++        } else {
++            2
++        }
+     }
+     /// `rideHeight`: a third of a boat's height, 8/9 of a raft's.
+     fn ride_height(&self) -> f64 {
++        if let Some(v) = &self.mod_vehicle {
++            return v.profile.seat_height;
++        }
+         let height = HEIGHT as f32;
+         f64::from(if &*self.wood == "bamboo" {
+             height * 0.888_888_9
+@@ -125,7 +145,12 @@ impl Boat {
+         rider_offset: f64,
+         previous: bool,
+     ) -> Vec3 {
+-        let mut z = if self.chest { 0.15f32 } else { 0.0 };
++        let mut z = self
++            .mod_vehicle
++            .as_ref()
++            .map_or(if self.chest { 0.15f32 } else { 0.0 }, |v| {
++                v.profile.seat_z as f32
++            });
+         if count > 1 {
+             z = if index == 0 { 0.2 } else { -0.6 };
+             if animal {
+@@ -346,7 +371,151 @@ impl Game<'_> {
+         }
+     }
+     /// `AbstractBoat.tick` for one boat (`controlled` when the player rides it).
++    fn tick_mod_vehicle(&mut self, mut b: Boat, controlled: bool) -> Boat {
++        let profile = b.mod_vehicle.as_ref().unwrap().profile.clone();
++        b.previous = b.position;
++        b.previous_yaw = b.yaw;
++        b.hurt_time = (b.hurt_time - 1).max(0);
++        b.damage = (b.damage - 1.).max(0.);
++        if !controlled {
++            b.input = [false; 4];
++        }
++        let [left, right, forward, back] = b.input;
++        let speed = (b.velocity.x * b.velocity.x + b.velocity.z * b.velocity.z).sqrt();
++        b.delta_rotation = if controlled && speed > 0.005 {
++            (i32::from(right) - i32::from(left)) as f32
++                * profile.turn_speed
++                * (speed / profile.max_speed).min(1.) as f32
++        } else {
++            0.
++        };
++        let old_yaw = b.yaw;
++        b.yaw += b.delta_rotation;
++        let obstacles = self.boat_move_obstacles(&b);
++        let mut blocks = SceneCollisions {
++            world: &self.world,
++            binding: self.collision,
++            subject: None,
++        };
++        if !blocks
++            .unobstructed(b.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5)))
++            .unwrap_or(false)
++        {
++            b.yaw = old_yaw;
++            b.delta_rotation = 0.;
++        }
++        let thrust = f64::from(i32::from(forward) - i32::from(back)) * profile.acceleration;
++        let (sin, cos) = f64::from(b.yaw).to_radians().sin_cos();
++        b.velocity.x = (b.velocity.x * profile.drag - sin * thrust)
++            .clamp(-profile.max_speed, profile.max_speed);
++        b.velocity.z = (b.velocity.z * profile.drag + cos * thrust)
++            .clamp(-profile.max_speed, profile.max_speed);
++        let horizontal = (b.velocity.x * b.velocity.x + b.velocity.z * b.velocity.z).sqrt();
++        if horizontal > profile.max_speed {
++            b.velocity.x *= profile.max_speed / horizontal;
++            b.velocity.z *= profile.max_speed / horizontal;
++        }
++        b.velocity.y = (b.velocity.y - 0.08).max(-3.);
++        // Do not drive into unloaded chunks.
++        let next = b.position.add_vector(b.velocity);
++        if !self
++            .world
++            .chunks
++            .contains_key(&(next.x.floor() as i32 >> 4, next.z.floor() as i32 >> 4))
++        {
++            b.velocity = Vec3::ZERO;
++            return b;
++        }
++        let mut scene = EntityCollisions {
++            blocks,
++            entities: &obstacles,
++            border: None,
++        };
++        if let Ok(moved) = scene.resolve(b.bounds(), b.velocity, 0.6, b.on_ground) {
++            b.position = b.position.add_vector(moved);
++            b.on_ground = moved.y > b.velocity.y && b.velocity.y < 0.;
++            if (moved.x - b.velocity.x).abs() > 1e-7 {
++                b.velocity.x = 0.;
++            }
++            if (moved.y - b.velocity.y).abs() > 1e-7 {
++                b.velocity.y = 0.;
++            }
++            if (moved.z - b.velocity.z).abs() > 1e-7 {
++                b.velocity.z = 0.;
++            }
++        }
++        b
++    }
++    fn mod_vehicle_geometry(
++        &self,
++        b: &Boat,
++        camera: glam::DVec3,
++        alpha: f64,
++        out: &mut Vec<Vertex>,
++    ) {
++        let Some(v) = &b.mod_vehicle else {
++            return;
++        };
++        let Some(white) = self.gui.atlas.sprites.get("horizon/white") else {
++            return;
++        };
++        let uv = [(white.u0 + white.u1) / 2., (white.v0 + white.v1) / 2.];
++        let p = at(b.previous).lerp(at(b.position), alpha) - camera;
++        if p.length_squared() > 256. * 256. {
++            return;
++        }
++        let yaw = (b.previous_yaw + (b.yaw - b.previous_yaw) * alpha as f32).to_radians();
++        let transform =
++            glam::Mat4::from_translation(p.as_vec3()) * glam::Mat4::from_rotation_y(-yaw);
++        let l = self.world.light(
++            b.position.x.floor() as i32,
++            (b.position.y + 1.).floor() as i32,
++            b.position.z.floor() as i32,
++        );
++        let light = (u32::from(l >> 4) * 16) | ((u32::from(l & 15) * 16) << 8);
++        const FACES: [[usize; 4]; 6] = [
++            [0, 1, 3, 2],
++            [4, 6, 7, 5],
++            [0, 4, 5, 1],
++            [2, 3, 7, 6],
++            [0, 2, 6, 4],
++            [1, 5, 7, 3],
++        ];
++        for cube in &v.profile.boxes {
++            let points: [glam::Vec3; 8] = std::array::from_fn(|i| {
++                transform.transform_point3(glam::Vec3::new(
++                    if i & 1 == 0 { cube.min[0] } else { cube.max[0] },
++                    if i & 2 == 0 { cube.min[1] } else { cube.max[1] },
++                    if i & 4 == 0 { cube.min[2] } else { cube.max[2] },
++                ))
++            });
++            for (f, corners) in FACES.iter().enumerate() {
++                let shade = [0.8, 0.8, 0.6, 1., 0.8, 0.8][f];
++                let [r, g, bl, a] = cube.color.to_le_bytes();
++                let color = u32::from_le_bytes([
++                    (f32::from(r) * shade) as u8,
++                    (f32::from(g) * shade) as u8,
++                    (f32::from(bl) * shade) as u8,
++                    a,
++                ]);
++                for j in [0, 1, 2, 0, 2, 3] {
++                    out.push(Vertex {
++                        pos: points[corners[j]].to_array(),
++                        uv,
++                        layer: 0,
++                        color,
++                        light,
++                        normal: [0; 4],
++                        glint_uv: [0.; 2],
++                    });
++                }
++            }
++        }
++    }
+     pub(super) fn tick_boat(&mut self, mut b: Boat, controlled: bool) -> Boat {
++        if b.mod_vehicle.is_some() {
++            return self.tick_mod_vehicle(b, controlled);
++        }
+         b.previous = b.position;
+         b.previous_yaw = b.yaw;
+         b.old_status = b.status;
+@@ -831,7 +1000,12 @@ impl Game<'_> {
+         b.hurt_dir = -b.hurt_dir;
+         b.hurt_time = 10;
+         b.damage += damage * 10.0;
+-        let destroyed = creative || b.damage > 40.0;
++        let destroyed = if let Some(v) = &mut b.mod_vehicle {
++            v.health = (v.health - damage).max(0.);
++            creative || v.health <= 0.
++        } else {
++            creative || b.damage > 40.0
++        };
+         if destroyed {
+             self.eject_boat_mobs(i, true);
+             let b = self.boats.remove(i);
+@@ -841,7 +1015,10 @@ impl Game<'_> {
+                 for stack in b.items.iter().flatten() {
+                     self.spawn_item(stack.clone(), at, super::dispenser::new_item_motion(), 10);
+                 }
+-                let item = b.entity_type();
++                let item = b
++                    .mod_vehicle
++                    .as_ref()
++                    .map_or_else(|| b.entity_type(), |v| v.profile.item.clone());
+                 self.spawn_item(
+                     ItemStack {
+                         item: Arc::from(item.as_str()),
+@@ -866,6 +1043,10 @@ impl Game<'_> {
+         );
+         for b in &self.boats {
+             let entity_start = out.len();
++            if b.mod_vehicle.is_some() {
++                self.mod_vehicle_geometry(b, camera, alpha, out);
++                continue;
++            }
+             // EntityRenderer.shouldRender.
+             let (previous, position) = (at(b.previous), at(b.position));
+             if !self.standing_entity_in_view(
+diff --git a/crates/horizon-client/src/game/creatures.rs b/crates/horizon-client/src/game/creatures.rs
+index f7d4828f1..ae0212074 100644
+--- a/crates/horizon-client/src/game/creatures.rs
++++ b/crates/horizon-client/src/game/creatures.rs
+@@ -2316,6 +2316,12 @@ impl Game<'_> {
+             // Arrows also hit minecarts (VehicleEntity is pickable).
+             let mut arrow_targets = targets.clone();
+             arrow_targets.extend(self.carts.iter().map(|c| (Who::Mob(c.id), c.bounds())));
++            arrow_targets.extend(
++                self.boats
++                    .iter()
++                    .filter(|b| b.mod_vehicle.is_some())
++                    .map(|b| (Who::Mob(b.id), b.bounds())),
++            );
+             // Mobs' projectiles also hit the guests (game/lan_mobs.rs).
+             let guests = self.lan_projectile_targets();
+             let mut arrow_targets_guests = arrow_targets.clone();
+@@ -2756,6 +2762,21 @@ impl Game<'_> {
+             self.hit_special(id, amount, by_player, false);
+             return Ok(());
+         }
++        if p.arrow.is_some()
++            && let Hit::Entity {
++                who: Who::Mob(id), ..
++            } = hit
++            && let Some(i) = self
++                .boats
++                .iter()
++                .position(|b| b.id == id && b.mod_vehicle.is_some())
++        {
++            let mut arrow = p.clone();
++            let amount = arrow_damage(&mut arrow, &mut self.world.random);
++            self.hurt_boat(i, amount, false);
++            self.finish_arrow_hit(arrow, EntityHit::Hurt);
++            return Ok(());
++        }
+         if p.arrow.is_some()
+             && let Hit::Entity {
+                 who: Who::Mob(id), ..
 diff --git a/crates/horizon-client/src/game/lan.rs b/crates/horizon-client/src/game/lan.rs
 index 83fdaf4be..b8f5889af 100644
 --- a/crates/horizon-client/src/game/lan.rs
@@ -78,6 +381,433 @@ index abe655c65..e8a523a8b 100644
              S::ChatCommandSigned(p) => self.guest_signed_command(host, conn, p),
              S::ChangeDifficulty(p) if host.hub.guests[gi].permission >= 2 => {
                  if !self.level.difficulty_locked && (0..=3).contains(&p.difficulty) {
+diff --git a/crates/horizon-client/src/game/lan_vehicles.rs b/crates/horizon-client/src/game/lan_vehicles.rs
+index 00795aa62..0bb3665aa 100644
+--- a/crates/horizon-client/src/game/lan_vehicles.rs
++++ b/crates/horizon-client/src/game/lan_vehicles.rs
+@@ -139,6 +139,11 @@ impl Game<'_> {
+                     game.dismount(i);
+                     return None;
+                 }
++                if game.boats[i].mod_vehicle.is_some() {
++                    let mut b = game.boats[i].clone();
++                    b.input = [keys.left, keys.right, keys.forward, keys.backward];
++                    game.boats[i] = game.tick_boat(b, true);
++                }
+                 let p = game.player_boat_seat(i);
+                 return Some([p.x, p.y, p.z]);
+             }
+@@ -158,6 +163,20 @@ impl Game<'_> {
+             g.previous_position = g.position;
+             g.position = at;
+         }
++        if let Some(b) = self
++            .boats
++            .iter()
++            .find(|b| b.id == vehicle && b.mod_vehicle.is_some())
++        {
++            host.hub.send_to(
++                conn,
++                &C::MoveVehicle(play::MoveVehicle {
++                    position: [b.position.x, b.position.y, b.position.z],
++                    yaw: b.yaw,
++                    pitch: 0.,
++                }),
++            );
++        }
+     }
+ 
+     /// After an interaction: a player that got into a vehicle sits in it,
+@@ -267,6 +286,10 @@ impl Game<'_> {
+             return;
+         };
+         let b = &self.boats[i];
++        if b.mod_vehicle.is_some() {
++            back(host, b.position, b.yaw);
++            return;
++        }
+         let old = b.position;
+         let good = good.map_or(old, |g| Vec3::new(g[0], g[1], g[2]));
+         let target = Vec3::new(
+diff --git a/crates/horizon-client/src/game/levels.rs b/crates/horizon-client/src/game/levels.rs
+index ab316c4c6..0804de5bb 100644
+--- a/crates/horizon-client/src/game/levels.rs
++++ b/crates/horizon-client/src/game/levels.rs
+@@ -126,6 +126,15 @@ impl Levels {
+     pub(super) fn parked_dims(&self) -> Vec<Dim> {
+         self.parked.keys().copied().collect()
+     }
++
++    /// Native boat/ground-chassis entities outside the level in place, for
++    /// server mods' authoritative vehicle snapshots.
++    #[cfg(feature = "mods")]
++    pub(super) fn parked_boats(&self) -> impl Iterator<Item = (Dim, &boats::Boat)> {
++        self.parked
++            .iter()
++            .flat_map(|(dim, parked)| parked.boats.iter().map(move |boat| (*dim, boat)))
++    }
+ }
+ 
+ impl Game<'_> {
+diff --git a/crates/horizon-client/src/game/mod_gameplay.rs b/crates/horizon-client/src/game/mod_gameplay.rs
+new file mode 100644
+index 000000000..5a9956812
+--- /dev/null
++++ b/crates/horizon-client/src/game/mod_gameplay.rs
+@@ -0,0 +1,284 @@
++//! Generic mod gameplay adapter. All mutations execute on the authoritative
++//! game thread, against the selected stack, with no client supplied aim/pose.
++#[cfg(feature = "mods")]
++use super::{Game, boats::Boat, lan::LanHost};
++#[cfg(feature = "mods")]
++use horizon_client::{
++    items::ItemStack,
++    mod_vehicle::{self, ModVehicle, VehicleProfile},
++};
++#[cfg(feature = "mods")]
++use horizon_core::geometry::Vec3;
++#[cfg(feature = "mods")]
++impl Game<'_> {
++    pub(super) fn mod_inventories(&self) -> Vec<(String, horizon_mods::PlayerInventory)> {
++        let mut result = Vec::new();
++        for owner in self.mods.mods.gameplay_ids() {
++            let stacks = |items: &[Option<ItemStack>], selected: usize| {
++                items
++                    .iter()
++                    .enumerate()
++                    .filter_map(|(slot, s)| {
++                        s.as_ref().map(|s| horizon_mods::InventoryStack {
++                            slot: slot as u32,
++                            item: s.item.to_string(),
++                            count: s.count,
++                            selected: slot == selected,
++                            state: mod_vehicle::item_state(s, &owner),
++                        })
++                    })
++                    .collect()
++            };
++            if self.remote.is_none()
++                && self.options.execution_role.is_client()
++                && self.player.is_some()
++            {
++                result.push((
++                    owner.clone(),
++                    horizon_mods::PlayerInventory {
++                        player: self.player_uuid_string(),
++                        stacks: stacks(&self.inventory, self.selected),
++                    },
++                ));
++            }
++            if let Some(host) = &self.lan {
++                for g in host.hub.guests.iter().filter(|g| g.placed) {
++                    result.push((
++                        owner.clone(),
++                        horizon_mods::PlayerInventory {
++                            player: super::mod_network::uuid_string(g.uuid),
++                            stacks: stacks(&g.inventory, g.selected),
++                        },
++                    ));
++                }
++            }
++        }
++        result
++    }
++    pub(super) fn mod_vehicles(&self) -> Vec<(String, horizon_mods::ModVehicle)> {
++        self.boats
++            .iter()
++            .map(|boat| (self.dim, boat))
++            .chain(
++                self.levels
++                    .parked_boats()
++                    .filter(|(dim, _)| *dim != self.dim),
++            )
++            .filter_map(|(dim, b)| {
++                let v = b.mod_vehicle.as_ref()?;
++                Some((
++                    v.owner.clone(),
++                    horizon_mods::ModVehicle {
++                        entity: b.id,
++                        definition: v.profile.definition.clone(),
++                        dimension: dim.id().into(),
++                        profile: serde_json::to_string(&v.profile).ok()?,
++                        x: b.position.x,
++                        y: b.position.y,
++                        z: b.position.z,
++                        yaw: b.yaw,
++                        vx: b.velocity.x,
++                        vy: b.velocity.y,
++                        vz: b.velocity.z,
++                    },
++                ))
++            })
++            .collect()
++    }
++    pub(super) fn apply_mod_inventory(
++        &mut self,
++        host: Option<&mut LanHost>,
++        owner: &str,
++        edit: horizon_mods::InventoryEdit,
++    ) {
++        if self.remote.is_some() {
++            return;
++        }
++        if self.options.execution_role.is_client()
++            && self.player.is_some()
++            && self.player_uuid_string() == edit.player
++        {
++            self.commit_mod_inventory(owner, edit);
++            return;
++        }
++        let own_host = host.is_none();
++        let mut taken = if own_host { self.lan.take() } else { None };
++        if let Some(host) = host.or(taken.as_mut()) {
++            let target = host
++                .hub
++                .guests
++                .iter()
++                .find(|g| {
++                    g.placed
++                        && g.loaded
++                        && !g.dead
++                        && super::mod_network::uuid_string(g.uuid) == edit.player
++                })
++                .map(|g| (g.conn, super::Dim::from_id(&g.dimension)));
++            if let Some((conn, theirs)) = target
++                && !self.on_server_trip(conn)
++            {
++                // as_guest lends only the player's state. The world and
++                // entities must first be those of that player's dimension.
++                let back = self.dim;
++                let entered = if theirs == back {
++                    true
++                } else {
++                    match self.enter_level(Some(host), theirs) {
++                        Ok(()) => self.dim == theirs,
++                        Err(error) => {
++                            log::error!("could not open {} for mod gameplay: {error}", theirs.id());
++                            false
++                        }
++                    }
++                };
++                if entered {
++                    self.as_guest(host, conn, |game| game.commit_mod_inventory(owner, edit));
++                }
++                if self.dim != back
++                    && let Err(error) = self.enter_level(Some(host), back)
++                {
++                    log::error!("could not reopen {} after mod gameplay: {error}", back.id());
++                }
++            }
++        }
++        if own_host {
++            self.lan = taken;
++        }
++    }
++    fn commit_mod_inventory(&mut self, owner: &str, edit: horizon_mods::InventoryEdit) {
++        if self.selected != edit.slot as usize
++            || self.spectator()
++            || self.player.as_ref().is_none_or(|p| p.health.health() <= 0.)
++        {
++            return;
++        }
++        let Some(held) = self.held() else {
++            return;
++        };
++        if held.item.as_ref() != edit.item
++            || held.count != 1
++            || mod_vehicle::item_state(held, owner) != edit.expected
++        {
++            return;
++        }
++        let available: u32 = self
++            .inventory
++            .iter()
++            .flatten()
++            .filter(|s| s.item.as_ref() == edit.ammo)
++            .map(|s| s.count)
++            .sum();
++        if (edit.consume > 0 && edit.ammo == edit.item) || available < edit.consume {
++            return;
++        }
++        let Some(eye) = self.eye_position() else {
++            return;
++        };
++        let spawn = if let Some(json) = &edit.vehicle {
++            let Some(profile) = VehicleProfile::parse(json, owner).filter(|p| p.item == edit.item)
++            else {
++                return;
++            };
++            // The native placement ray stops at blocks. A failed placement
++            // leaves both the item and all its data untouched.
++            let Some(hit) = self.pick() else {
++                return;
++            };
++            let at = Vec3::new(hit.point[0], hit.point[1] + 0.02, hit.point[2]);
++            let mut b = Boat::new(self.next_entity + 1, "oak".into(), at, self.yaw);
++            b.mod_vehicle = Some(ModVehicle {
++                owner: owner.into(),
++                health: profile.max_health,
++                profile,
++            });
++            let mut scene = horizon_client::collisions::SceneCollisions {
++                world: &self.world,
++                binding: self.collision,
++                subject: None,
++            };
++            if self.boat_entity_collision(b.bounds()) {
++                return;
++            }
++            if !scene
++                .unobstructed(b.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5)))
++                .unwrap_or(false)
++            {
++                return;
++            }
++            Some(b)
++        } else {
++            None
++        };
++        if !mod_vehicle::apply_inventory_edit(&mut self.inventory, self.selected, owner, &edit) {
++            return;
++        }
++        if let Some(b) = spawn {
++            self.next_entity += 1;
++            self.world.modified.insert((
++                b.position.x.floor() as i32 >> 4,
++                b.position.z.floor() as i32 >> 4,
++            ));
++            self.boats.push(b);
++        }
++        if let Some(spec) = edit.shot {
++            use horizon_client::{
++                mobs::Who as Owner,
++                projectiles::{Projectile, ProjectileKind},
++            };
++            let kind = ProjectileKind::Arrow {
++                base_damage: f64::from(spec.damage / spec.speed),
++                critical: false,
++                effect: None,
++            };
++            let mut p = Projectile::new(
++                kind,
++                Vec3::new(eye[0], eye[1] - 0.1, eye[2]),
++                Some(Owner::Player),
++            );
++            if let Some(a) = p.arrow.as_mut() {
++                a.set_owner(Some(Owner::Player));
++                a.set_item(&horizon_client::arrows::drawn_ammo(
++                    &ItemStack::new("minecraft:arrow", 1),
++                    true,
++                ));
++            }
++            p.shoot_from_rotation(
++                &mut self.world.random,
++                self.pitch,
++                self.yaw,
++                0.,
++                spec.speed,
++                spec.inaccuracy,
++                Vec3::ZERO,
++                true,
++            );
++            self.add_projectile(p);
++            self.player_projectile_shot();
++            self.audio.play(
++                "minecraft:entity.firework_rocket.blast",
++                Some(eye),
++                0.7,
++                1.6,
++            );
++        }
++    }
++    pub(super) fn apply_vehicle_models(&mut self, owner: &str, models: Vec<(u32, String)>) {
++        if self.remote.is_none() {
++            return;
++        } // A client never overrides authoritative profiles.
++        for b in &mut self.boats {
++            if let Some((_, json)) = models.iter().find(|(id, _)| *id == b.id) {
++                if let Some(profile) = VehicleProfile::parse(json, owner) {
++                    b.mod_vehicle = Some(ModVehicle {
++                        owner: owner.into(),
++                        health: profile.max_health,
++                        profile,
++                    });
++                }
++            } else if b.mod_vehicle.as_ref().is_some_and(|v| v.owner == owner) {
++                b.mod_vehicle = None;
++            }
++        }
++    }
++}
+diff --git a/crates/horizon-client/src/game/mod_input.rs b/crates/horizon-client/src/game/mod_input.rs
+index 3769b03c9..e337560b3 100644
+--- a/crates/horizon-client/src/game/mod_input.rs
++++ b/crates/horizon-client/src/game/mod_input.rs
+@@ -75,6 +75,24 @@ impl Game<'_> {
+     /// The use button while playing: true when a mod claimed the held item,
+     /// so the game does nothing else with it (no placing, eating, swing).
+     pub(super) fn mod_use(&mut self, button: MouseButton, pressed: bool) -> bool {
++        if button == MouseButton::Left {
++            if !pressed {
++                return self.stop_mod_attack();
++            }
++            let Some(item) = self
++                .mod_held()
++                .filter(|h| self.mods.mods.claims_attack(&h.id))
++            else {
++                return false;
++            };
++            self.stop_vanilla_claimed_attack();
++            self.mods.mods.attack_input(&item, 0, true);
++            self.mods.attacking = Some(ModUse {
++                item,
++                since: self.ticks,
++            });
++            return true;
++        }
+         if button != MouseButton::Right || !self.mods.mods.claims_any() {
+             return false;
+         }
+@@ -103,7 +121,39 @@ impl Game<'_> {
+     }
+     /// Once a tick: a claimed use stops when its item leaves the hand or a
+     /// screen opens, as vanilla's `releaseUsingItem`.
++    fn stop_mod_attack(&mut self) -> bool {
++        let Some(u) = self.mods.attacking.take() else {
++            return false;
++        };
++        self.mods.mods.attack_input(
++            &u.item,
++            self.ticks.saturating_sub(u.since).min(u32::MAX.into()) as u32,
++            false,
++        );
++        true
++    }
++    /// Taking an item claim also ends an attack already held on a previous
++    /// item, including a toggled button and a queued remote mining stop.
++    fn stop_vanilla_claimed_attack(&mut self) {
++        self.left = false;
++        self.toggles.0[2].reset();
++        self.stop_mining();
++    }
+     pub(super) fn tick_mod_use(&mut self) {
++        if self
++            .mod_held()
++            .is_some_and(|h| self.mods.mods.claims_attack(&h.id))
++        {
++            self.stop_vanilla_claimed_attack();
++        }
++        if let Some(u) = &self.mods.attacking {
++            let still = self
++                .mod_held()
++                .is_some_and(|h| h.id == u.item.id && h.slot == u.item.slot);
++            if !still || self.screen != Screen::Playing {
++                self.stop_mod_attack();
++            }
++        }
+         let Some(u) = &self.mods.using else {
+             return;
+         };
 diff --git a/crates/horizon-client/src/game/mod_network.rs b/crates/horizon-client/src/game/mod_network.rs
 new file mode 100644
 index 000000000..d54db49f5
@@ -193,10 +923,19 @@ index 000000000..d54db49f5
 +    )
 +}
 diff --git a/crates/horizon-client/src/game/mods.rs b/crates/horizon-client/src/game/mods.rs
-index 52dc46fe0..afa0760f2 100644
+index 52dc46fe0..7af1532fa 100644
 --- a/crates/horizon-client/src/game/mods.rs
 +++ b/crates/horizon-client/src/game/mods.rs
-@@ -464,7 +464,13 @@ impl Game<'_> {
+@@ -43,6 +43,8 @@ pub(super) struct ModsState {
+     /// Capability `input`: a claimed item's use while the button is down.
+     #[cfg(feature = "mods")]
+     pub(super) using: Option<super::mod_input::ModUse>,
++    #[cfg(feature = "mods")]
++    pub(super) attacking: Option<super::mod_input::ModUse>,
+     /// Capability `render`'s camera shakes.
+     #[cfg(feature = "mods")]
+     pub(super) shake: super::mod_render::Shake,
+@@ -464,7 +466,17 @@ impl Game<'_> {
                  .collect();
          }
          let (recipes, known_recipes) = self.mod_recipes();
@@ -205,15 +944,27 @@ index 52dc46fe0..afa0760f2 100644
 +                .remote
 +                .as_ref()
 +                .map_or(self.mods.server, |remote| remote.mod_channel);
++        let inventories = self.mod_inventories();
++        let vehicles = self.mod_vehicles();
          Snapshot {
++            inventories,
++            vehicles,
 +            network_connected,
              player,
              clock,
              gui_size: self.gui_size(),
-@@ -666,6 +672,15 @@ impl Game<'_> {
+@@ -666,6 +678,23 @@ impl Game<'_> {
      pub(super) fn route_mod_output(&mut self, mut host: Option<&mut LanHost>) {
          for output in self.mods.mods.drain() {
              let line = match output {
++                Output::Gameplay { mod_id, edit } => {
++                    self.apply_mod_inventory(host.as_deref_mut(), &mod_id, edit);
++                    continue;
++                }
++                Output::VehicleModels { mod_id, models } => {
++                    self.apply_vehicle_models(&mod_id, models);
++                    continue;
++                }
 +                Output::Network {
 +                    mod_id,
 +                    player,
@@ -226,8 +977,57 @@ index 52dc46fe0..afa0760f2 100644
                  Output::Chat { name, text } => {
                      let mut line = Text::literal(format!("[{name}] ")).with_color(text::GRAY);
                      line.push(Text::literal(text));
+diff --git a/crates/horizon-client/src/game/persist.rs b/crates/horizon-client/src/game/persist.rs
+index 8ceea7e12..c08ed08b4 100644
+--- a/crates/horizon-client/src/game/persist.rs
++++ b/crates/horizon-client/src/game/persist.rs
+@@ -268,6 +268,28 @@ impl Game<'_> {
+                                     super::boats::CHEST_SLOTS,
+                                 );
+                             }
++                            b.mod_vehicle = tag
++                                .get("HorizonModVehicle")
++                                .and_then(|t| {
++                                    if let horizon_world::nbt::Tag::String(s) = t {
++                                        Some(s)
++                                    } else {
++                                        None
++                                    }
++                                })
++                                .and_then(|s| {
++                                    serde_json::from_str::<horizon_client::mod_vehicle::ModVehicle>(
++                                        &s.to_string_lossy(),
++                                    )
++                                    .ok()
++                                })
++                                .filter(|v| {
++                                    horizon_client::mod_vehicle::VehicleProfile::parse(
++                                        &serde_json::to_string(&v.profile).unwrap_or_default(),
++                                        &v.owner,
++                                    )
++                                    .is_some()
++                                });
+                             b.velocity = velocity;
+                             self.remember(id, uuid, tag);
+                             self.boats.push(b);
+@@ -752,6 +774,15 @@ impl Game<'_> {
+                 self.persist.raw.get(&id),
+                 b.chest.then_some(&b.items[..]),
+             );
++            if let Some(v) = &b.mod_vehicle
++                && let Ok(json) = serde_json::to_string(v)
++                && let horizon_world::nbt::Tag::Compound(entries) = &mut tag
++            {
++                entries.insert(
++                    "HorizonModVehicle".into(),
++                    horizon_world::nbt::Tag::String(json.as_str().into()),
++                );
++            }
+             self.put_mob_passengers(&mut tag, id);
+             out.entry(chunk_of(at)).or_default().push(tag);
+         }
 diff --git a/crates/horizon-client/src/game/remote.rs b/crates/horizon-client/src/game/remote.rs
-index 22b7c13df..d2d9b455f 100644
+index 22b7c13df..eb72167a4 100644
 --- a/crates/horizon-client/src/game/remote.rs
 +++ b/crates/horizon-client/src/game/remote.rs
 @@ -111,6 +111,7 @@ pub(super) struct Remote {
@@ -281,6 +1081,71 @@ index 22b7c13df..d2d9b455f 100644
              // ClientCommonPacketListenerImpl.handlePing runs on the game
              // thread, after all preceding packets (especially teleports).
              C::Ping(p) => self.send(S::Pong(p)),
+@@ -5241,6 +5260,15 @@ impl Game<'_> {
+     }
+ 
+     fn remote_start_attack(&mut self) -> bool {
++        // A click queued before switching to a claimed item belongs to the
++        // old vanilla hand; it must not become melee/mining with the new one.
++        #[cfg(feature = "mods")]
++        if self
++            .mod_held()
++            .is_some_and(|h| self.mods.mods.claims_attack(&h.id))
++        {
++            return false;
++        }
+         if self.clicks.miss_time > 0 {
+             return false;
+         }
+diff --git a/crates/horizon-client/src/game/remote_objects.rs b/crates/horizon-client/src/game/remote_objects.rs
+index d70ab795d..f98d601ff 100644
+--- a/crates/horizon-client/src/game/remote_objects.rs
++++ b/crates/horizon-client/src/game/remote_objects.rs
+@@ -232,7 +232,7 @@ impl Game<'_> {
+         // The boat the player drives turns here (isLocalInstanceAuthoritative).
+         let driven = self.riding;
+         if let Some(b) = self.boats.iter_mut().find(|b| b.id == id) {
+-            if Some(id) == driven {
++            if Some(id) == driven && b.mod_vehicle.is_none() {
+                 return;
+             }
+             if let Some(yaw) = yaw {
+@@ -262,7 +262,7 @@ impl Game<'_> {
+         // The boat the player drives moves here, not where the server says.
+         let driven = self.riding;
+         for b in &mut self.boats {
+-            if Some(b.id) == driven {
++            if Some(b.id) == driven && b.mod_vehicle.is_none() {
+                 continue;
+             }
+             b.previous = b.position;
+diff --git a/crates/horizon-client/src/game/remote_vehicles.rs b/crates/horizon-client/src/game/remote_vehicles.rs
+index c9cbf1159..191f2523a 100644
+--- a/crates/horizon-client/src/game/remote_vehicles.rs
++++ b/crates/horizon-client/src/game/remote_vehicles.rs
+@@ -163,7 +163,11 @@ impl Game<'_> {
+             // AbstractBoat.tick on the controlling client: steer and move.
+             let mut b = self.boats[i].clone();
+             b.input = [keys.left, keys.right, keys.forward, keys.backward];
+-            let b = self.tick_boat(b, true);
++            let b = if b.mod_vehicle.is_some() {
++                b
++            } else {
++                self.tick_boat(b, true)
++            };
+             // positionRider: the seat turns with the boat; clampRotation.
+             self.yaw += b.delta_rotation;
+             let delta = (self.yaw - b.yaw + 180.0).rem_euclid(360.0) - 180.0;
+@@ -198,6 +202,9 @@ impl Game<'_> {
+         else {
+             return Vec::new();
+         };
++        if b.mod_vehicle.is_some() {
++            return Vec::new();
++        }
+         vec![
+             S::MoveVehicle(play::MoveVehicleRequest {
+                 position: [b.position.x, b.position.y, b.position.z],
 diff --git a/crates/horizon-client/src/lan/conn.rs b/crates/horizon-client/src/lan/conn.rs
 index 99b70e065..ed70d1de8 100644
 --- a/crates/horizon-client/src/lan/conn.rs
@@ -301,6 +1166,286 @@ index 99b70e065..ed70d1de8 100644
          send(
              c,
              cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+diff --git a/crates/horizon-client/src/lib.rs b/crates/horizon-client/src/lib.rs
+index d4ef4c209..d2fa67967 100644
+--- a/crates/horizon-client/src/lib.rs
++++ b/crates/horizon-client/src/lib.rs
+@@ -212,3 +212,5 @@ pub use horizon_items::enchant;
+ pub use horizon_items::item_data;
+ pub use horizon_items::items;
+ pub use horizon_items::random_sequences;
++
++pub mod mod_vehicle;
+diff --git a/crates/horizon-client/src/mod_vehicle.rs b/crates/horizon-client/src/mod_vehicle.rs
+new file mode 100644
+index 000000000..c041a1b46
+--- /dev/null
++++ b/crates/horizon-client/src/mod_vehicle.rs
+@@ -0,0 +1,264 @@
++//! Generic data-only ground vehicle profile. Mods supply their own tuning and
++//! cuboids; the engine supplies native passengers, persistence and collisions.
++use serde::{Deserialize, Serialize};
++#[derive(Clone, Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct VehicleProfile {
++    pub definition: String,
++    pub item: String,
++    pub width: f64,
++    pub length: f64,
++    pub height: f64,
++    pub seat_height: f64,
++    #[serde(default)]
++    pub seat_z: f64,
++    pub acceleration: f64,
++    pub drag: f64,
++    pub max_speed: f64,
++    pub turn_speed: f32,
++    pub max_health: f32,
++    pub boxes: Vec<ModelBox>,
++}
++#[derive(Clone, Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ModelBox {
++    pub min: [f32; 3],
++    pub max: [f32; 3],
++    /// RGBA, little endian (red in the low byte).
++    pub color: u32,
++}
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct ModVehicle {
++    pub owner: String,
++    pub profile: VehicleProfile,
++    pub health: f32,
++}
++impl VehicleProfile {
++    pub fn parse(json: &str, owner: &str) -> Option<Self> {
++        if json.len() > 16384 {
++            return None;
++        }
++        let p: Self = serde_json::from_str(json).ok()?;
++        let owned = |s: &str| s.starts_with(&format!("{owner}:")) && s.len() <= 128;
++        let range = |v: f64, a, b| v.is_finite() && (a..=b).contains(&v);
++        (owned(&p.definition)
++            && owned(&p.item)
++            && range(p.width, 0.5, 6.)
++            && range(p.length, 0.5, 8.)
++            && range(p.height, 0.3, 5.)
++            && range(p.seat_height, 0., p.height)
++            && range(p.seat_z, -p.length / 2., p.length / 2.)
++            && range(p.acceleration, 0.001, 0.2)
++            && range(p.drag, 0.5, 0.999)
++            && range(p.max_speed, 0.01, 2.)
++            && range(p.turn_speed.into(), 0.1, 10.)
++            && range(p.max_health.into(), 1., 10000.)
++            && !p.boxes.is_empty()
++            && p.boxes.len() <= 64
++            && p.boxes.iter().all(|b| {
++                (0..3).all(|i| {
++                    range(b.min[i].into(), -8., 8.)
++                        && range(b.max[i].into(), -8., 8.)
++                        && b.min[i] < b.max[i]
++                })
++            }))
++        .then_some(p)
++    }
++}
++/// Mod state sits under the vanilla custom_data component so it follows a
++/// stack through saves, containers, death drops and native inventory packets.
++pub fn item_state(stack: &crate::items::ItemStack, owner: &str) -> Vec<u8> {
++    stack
++        .data()
++        .and_then(|d| d.other("minecraft:custom_data"))
++        .and_then(|t| t.get("horizon_mod_state"))
++        .and_then(|t| t.get(owner))
++        .and_then(|t| {
++            if let horizon_world::nbt::Tag::ByteArray(b) = t {
++                Some(b.clone())
++            } else {
++                None
++            }
++        })
++        .unwrap_or_default()
++}
++pub fn set_item_state(stack: &mut crate::items::ItemStack, owner: &str, bytes: Vec<u8>) {
++    use horizon_world::nbt::{JavaString, Tag};
++    fn put(tag: &mut Tag, key: &str, val: Tag) {
++        if let Tag::Compound(entries) = tag {
++            entries.insert(JavaString::from(key), val);
++        }
++    }
++    let mut data = stack
++        .data()
++        .and_then(|d| d.other("minecraft:custom_data"))
++        .cloned()
++        .filter(|t| matches!(t, Tag::Compound(_)))
++        .unwrap_or_else(|| Tag::Compound(Default::default()));
++    let mut states = data
++        .get("horizon_mod_state")
++        .cloned()
++        .filter(|t| matches!(t, Tag::Compound(_)))
++        .unwrap_or_else(|| Tag::Compound(Default::default()));
++    put(&mut states, owner, Tag::ByteArray(bytes));
++    put(&mut data, "horizon_mod_state", states);
++    stack
++        .data_mut()
++        .set_other("minecraft:custom_data", Some(data));
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn item_state_survives_saved_components_and_preserves_other_mods() {
++        let mut stack = crate::items::ItemStack::new("test:gun", 1);
++        set_item_state(&mut stack, "first", vec![0, 1, 255]);
++        set_item_state(&mut stack, "second", vec![7]);
++        let tag = crate::item_data::encode_components(&stack);
++        let mut restored = crate::items::ItemStack::new("test:gun", 1);
++        let (damage, extra) = crate::item_data::decode_components(tag.as_ref());
++        restored.damage = damage;
++        restored.extra = extra;
++        assert_eq!(item_state(&restored, "first"), vec![0, 1, 255]);
++        assert_eq!(item_state(&restored, "second"), vec![7]);
++    }
++}
++
++/// Native inventory compare/exchange used by the game adapter. Preflight all
++/// conditions before changing any slot; callers spawn effects only on true.
++#[cfg(feature = "mods")]
++pub fn apply_inventory_edit(
++    inventory: &mut [Option<crate::items::ItemStack>],
++    selected: usize,
++    owner: &str,
++    edit: &horizon_mods::InventoryEdit,
++) -> bool {
++    let Some(held) = inventory.get(selected).and_then(|s| s.as_ref()) else {
++        return false;
++    };
++    if selected != edit.slot as usize
++        || held.item.as_ref() != edit.item
++        || held.count != 1
++        || item_state(held, owner) != edit.expected
++        || (edit.consume > 0 && edit.ammo == edit.item)
++    {
++        return false;
++    }
++    let available: u64 = inventory
++        .iter()
++        .flatten()
++        .filter(|s| s.item.as_ref() == edit.ammo)
++        .map(|s| u64::from(s.count))
++        .sum();
++    if available < u64::from(edit.consume) {
++        return false;
++    }
++    let mut left = edit.consume;
++    for (slot, cell) in inventory.iter_mut().enumerate() {
++        if slot == selected {
++            continue;
++        }
++        if let Some(s) = cell.as_mut().filter(|s| s.item.as_ref() == edit.ammo) {
++            let n = left.min(s.count);
++            s.count -= n;
++            left -= n;
++            if s.count == 0 {
++                *cell = None;
++            }
++        }
++    }
++    if edit.vehicle.is_some() {
++        inventory[selected] = None;
++    } else if let Some(s) = inventory[selected].as_mut() {
++        set_item_state(s, owner, edit.state.clone());
++    }
++    true
++}
++#[cfg(all(test, feature = "mods"))]
++mod inventory_tests {
++    use super::*;
++    #[test]
++    fn stale_edits_and_insufficient_ammo_leave_every_slot_untouched() {
++        use crate::items::ItemStack;
++        let mut inventory = vec![
++            Some(ItemStack::new("test:gun", 1)),
++            Some(ItemStack::new("test:ammo", 2)),
++        ];
++        let mut edit = horizon_mods::InventoryEdit {
++            player: "p".into(),
++            slot: 0,
++            item: "test:gun".into(),
++            expected: vec![],
++            state: vec![1],
++            ammo: "test:ammo".into(),
++            consume: 3,
++            shot: None,
++            vehicle: None,
++        };
++        let original = inventory.clone();
++        assert!(!apply_inventory_edit(&mut inventory, 0, "test", &edit));
++        assert_eq!(inventory, original);
++        edit.consume = 2;
++        assert!(apply_inventory_edit(&mut inventory, 0, "test", &edit));
++        assert_eq!(item_state(inventory[0].as_ref().unwrap(), "test"), vec![1]);
++        assert!(inventory[1].is_none());
++        let after = inventory.clone();
++        edit.consume = 0;
++        assert!(!apply_inventory_edit(&mut inventory, 0, "test", &edit));
++        assert_eq!(inventory, after);
++        edit.expected = vec![1];
++        assert!(!apply_inventory_edit(&mut inventory, 1, "test", &edit));
++        assert_eq!(inventory, after);
++    }
++}
++
++#[cfg(test)]
++mod profile_tests {
++    use super::*;
++    fn profile() -> VehicleProfile {
++        VehicleProfile {
++            definition: "test:car".into(),
++            item: "test:car".into(),
++            width: 2.,
++            length: 3.2,
++            height: 1.6,
++            seat_height: 0.85,
++            seat_z: 0.,
++            acceleration: 0.035,
++            drag: 0.96,
++            max_speed: 0.65,
++            turn_speed: 3.,
++            max_health: 175.,
++            boxes: vec![ModelBox {
++                min: [-1., 0., -1.6],
++                max: [1., 1.6, 1.6],
++                color: 0xff112233,
++            }],
++        }
++    }
++    #[test]
++    fn only_owned_bounded_finite_vehicle_profiles_load() {
++        let mut p = profile();
++        assert!(VehicleProfile::parse(&serde_json::to_string(&p).unwrap(), "test").is_some());
++        assert!(VehicleProfile::parse(&serde_json::to_string(&p).unwrap(), "other").is_none());
++        p.max_speed = 100.;
++        assert!(VehicleProfile::parse(&serde_json::to_string(&p).unwrap(), "test").is_none());
++        p = profile();
++        p.boxes[0].max[0] = -2.;
++        assert!(VehicleProfile::parse(&serde_json::to_string(&p).unwrap(), "test").is_none());
++        assert!(VehicleProfile::parse(r#"{"max_speed":1e999}"#, "test").is_none());
++    }
++    #[test]
++    fn saved_vehicle_profile_and_damage_round_trip() {
++        let original = ModVehicle {
++            owner: "test".into(),
++            profile: profile(),
++            health: 48.5,
++        };
++        let restored: ModVehicle =
++            serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
++        assert_eq!(restored.owner, "test");
++        assert_eq!(restored.health, 48.5);
++        assert_eq!(restored.profile.boxes[0].color, 0xff112233);
++    }
++}
 diff --git a/crates/horizon-client/src/net.rs b/crates/horizon-client/src/net.rs
 index 93364ed91..88e156e8b 100644
 --- a/crates/horizon-client/src/net.rs
@@ -353,7 +1498,7 @@ index 93364ed91..88e156e8b 100644
 +    }
  }
 diff --git a/crates/horizon-mod-sdk/src/lib.rs b/crates/horizon-mod-sdk/src/lib.rs
-index 1e7120091..808a3fbed 100644
+index 1e7120091..6175b7eeb 100644
 --- a/crates/horizon-mod-sdk/src/lib.rs
 +++ b/crates/horizon-mod-sdk/src/lib.rs
 @@ -40,7 +40,7 @@ wit_bindgen::generate!({
@@ -373,11 +1518,43 @@ index 1e7120091..808a3fbed 100644
          },
      });
  
+@@ -198,6 +199,7 @@ pub mod server {
+         Argument, ArgumentKind, ArgumentValue, BlockPos, Guest as __Guest, Registration,
+         ServerCommand,
+     };
++    pub use horizon::mods::gameplay;
+     pub use horizon::mods::players::{self, GameMode, Player};
+     pub use horizon::mods::world::{self, BlockChange};
+ 
 diff --git a/crates/horizon-mod-sdk/wit/horizon.wit b/crates/horizon-mod-sdk/wit/horizon.wit
-index 0680cce92..56cc6da16 100644
+index 0680cce92..349224c6e 100644
 --- a/crates/horizon-mod-sdk/wit/horizon.wit
 +++ b/crates/horizon-mod-sdk/wit/horizon.wit
-@@ -783,6 +783,40 @@ interface server-events {
+@@ -245,6 +245,11 @@ interface input {
+     /// The items whose use the mod handles instead of the game, by id (at
+     /// most 64). Replaces the previous list.
+     claim-items: func(ids: list<string>);
++    /// Claim the attack button too: prevents mining and melee with these items.
++    claim-attack: func(ids: list<string>);
++    variant attack-event { start(item-use), stop(item-use) }
++    /// Claimed attack transitions, oldest first, separately from legacy use/key events.
++    poll-attack: func() -> list<attack-event>;
+     /// A key of the mod's: `name` comes back in `key-down` and `key-up`,
+     /// `label` says what it does, `key` is the key as options.txt writes
+     /// it (`key.keyboard.r`), the default: the player can bind another
+@@ -429,6 +434,11 @@ interface render {
+     /// Distance setting, when on, wins. One far terrain shows at a time: the
+     /// first loaded mod's.
+     set-far-terrain: func(far-terrain: option<far-terrain>);
++    record vehicle-model { entity: u32, profile: string }
++    /// Bind generic cuboid vehicle profiles to native entity ids. Replaces
++    /// this mod's bindings (at most 64). JSON schema: docs/api/gameplay.md.
++    /// Cosmetic on clients; server physics always uses its own profile.
++    set-vehicle-models: func(models: list<vehicle-model>);
+ }
+ 
+ /// What the game calls. Only the hooks `init` asks for are ever called.
+@@ -783,6 +793,74 @@ interface server-events {
      block-placed: func(player: player, pos: block-pos, state: string);
  }
  
@@ -415,10 +1592,44 @@ index 0680cce92..56cc6da16 100644
 +    poll: func() -> list<event>;
 +}
 +
++/// Experimental server capability: authoritative inventory transactions and
++/// generic rideable ground vehicles. All writes are deferred until the hook
++/// succeeds. Re-read inventory next tick to observe a committed write.
++interface gameplay {
++    record stack { slot: u32, item: string, count: u32, selected: bool, state: list<u8> }
++    record player-inventory { player: string, stacks: list<stack> }
++    record projectile { speed: f32, damage: f32, inaccuracy: f32 }
++    record edit {
++        player: string,
++        slot: u32,
++        item: string,
++        expected: list<u8>,
++        state: list<u8>,
++        ammo: string,
++        consume: u32,
++        shot: option<projectile>,
++        /// A validated JSON vehicle profile. Consumes the held item on success.
++        vehicle: option<string>,
++    }
++    record vehicle {
++        entity: u32, definition: string, dimension: string, profile: string,
++        x: f64, y: f64, z: f64, yaw: f32,
++        vx: f64, vy: f64, vz: f64,
++    }
++    /// Per-mod item state and slots for the online players, as of this tick.
++    inventories: func() -> list<player-inventory>;
++    /// Native vehicles owned by this mod across loaded dimensions.
++    vehicles: func() -> list<vehicle>;
++    /// Queue an atomic compare/exchange: selected stack must still match;
++    /// ammunition, item state and projectile/spawn either all commit or none.
++    /// Ok means queued. The next inventory snapshot confirms application.
++    commit: func(edit: edit) -> result<_, string>;
++}
++
  /// A client mod: runs in the player's game.
  world horizon-mod {
      import log;
-@@ -791,6 +825,7 @@ world horizon-mod {
+@@ -791,6 +869,7 @@ world horizon-mod {
      import hud;
      import storage;
      import command;
@@ -426,7 +1637,12 @@ index 0680cce92..56cc6da16 100644
      export events;
  }
  
-@@ -802,6 +837,7 @@ world horizon-server-mod {
+@@ -798,10 +877,12 @@ world horizon-mod {
+ /// runs where the world is simulated, on the dedicated server, a LAN host
+ /// and single player's own server.
+ world horizon-server-mod {
++    import gameplay;
+     import log;
      import storage;
      import players;
      import %world;
@@ -466,7 +1682,7 @@ index 8bfa58bcd..05db437a4 100644
  [lints]
  workspace = true
 diff --git a/crates/horizon-mods/src/api_level.rs b/crates/horizon-mods/src/api_level.rs
-index 045a9346b..421408507 100644
+index 045a9346b..508e11d29 100644
 --- a/crates/horizon-mods/src/api_level.rs
 +++ b/crates/horizon-mods/src/api_level.rs
 @@ -7,13 +7,13 @@
@@ -474,21 +1690,27 @@ index 045a9346b..421408507 100644
  
  /// The newest level this Horizon serves.
 -pub const LEVEL: u32 = 7;
-+pub const LEVEL: u32 = 8;
++pub const LEVEL: u32 = 9;
  
  /// Every function the game offers mods, as `interface.function`, with its
  /// level. Level 0 is the contract of Horizon 0.2.67 to 0.2.69. A new
  /// function takes the next level and raises [`LEVEL`] (the `api_reference`
  /// test fails until it is listed here).
 -pub const FUNCTIONS: [(&str, u32); 46] = [
-+pub const FUNCTIONS: [(&str, u32); 50] = [
++pub const FUNCTIONS: [(&str, u32); 56] = [
      ("log.write", 0),
      ("game.get-player", 0),
      ("game.get-clock", 0),
-@@ -60,6 +60,10 @@ pub const FUNCTIONS: [(&str, u32); 46] = [
+@@ -60,6 +60,16 @@ pub const FUNCTIONS: [(&str, u32); 46] = [
      ("recipes.place", 6),
      ("recipes.give", 6),
      ("render.set-far-terrain", 7),
++    ("input.claim-attack", 9),
++    ("input.poll-attack", 9),
++    ("render.set-vehicle-models", 9),
++    ("gameplay.inventories", 9),
++    ("gameplay.vehicles", 9),
++    ("gameplay.commit", 9),
 +    ("net.connected", 8),
 +    ("net.session-token", 8),
 +    ("net.send", 8),
@@ -497,46 +1719,53 @@ index 045a9346b..421408507 100644
  
  /// What the game's program carries so the launcher can read its level
 diff --git a/crates/horizon-mods/src/manifest.rs b/crates/horizon-mods/src/manifest.rs
-index c2f2f61fc..f4da87dc6 100644
+index c2f2f61fc..568487a2b 100644
 --- a/crates/horizon-mods/src/manifest.rs
 +++ b/crates/horizon-mods/src/manifest.rs
-@@ -103,9 +103,11 @@ pub enum Capability {
+@@ -103,9 +103,12 @@ pub enum Capability {
      /// The recipes and items the game knows, for recipe viewers
      /// (interface `recipes`).
      Recipes,
 +    /// Connection-scoped bytes between this mod's client and server halves.
 +    Net,
++    Gameplay,
  }
  impl Capability {
 -    pub const ALL: [Capability; 12] = [
-+    pub const ALL: [Capability; 13] = [
++    pub const ALL: [Capability; 14] = [
          Capability::GameRead,
          Capability::Chat,
          Capability::Hud,
-@@ -118,12 +120,13 @@ impl Capability {
+@@ -118,12 +121,18 @@ impl Capability {
          Capability::Players,
          Capability::World,
          Capability::Recipes,
 +        Capability::Net,
++        Capability::Gameplay,
      ];
      /// Whether a server mod may have it: the others act on a local player.
      pub fn on_server(self) -> bool {
          matches!(
              self,
 -            Capability::Storage | Capability::Players | Capability::World
-+            Capability::Storage | Capability::Players | Capability::World | Capability::Net
++            Capability::Storage
++                | Capability::Players
++                | Capability::World
++                | Capability::Net
++                | Capability::Gameplay
          )
      }
      /// The WIT interface it grants, in `horizon:mods`.
-@@ -141,6 +144,7 @@ impl Capability {
+@@ -141,6 +150,8 @@ impl Capability {
              Capability::Players => "players",
              Capability::World => "world",
              Capability::Recipes => "recipes",
 +            Capability::Net => "net",
++            Capability::Gameplay => "gameplay",
          }
      }
      /// May change in any release: a mod uses it only with
-@@ -148,7 +152,11 @@ impl Capability {
+@@ -148,7 +159,12 @@ impl Capability {
      pub fn is_experimental(self) -> bool {
          matches!(
              self,
@@ -546,28 +1775,33 @@ index c2f2f61fc..f4da87dc6 100644
 +                | Capability::Input
 +                | Capability::Recipes
 +                | Capability::Net
++                | Capability::Gameplay
          )
      }
      /// What the player reads before turning the mod on: "May <this>".
-@@ -170,6 +178,9 @@ impl Capability {
+@@ -170,6 +186,12 @@ impl Capability {
              Capability::Recipes => {
                  "read the game's recipes and items and which recipes you know, place recipes in your crafting grid and, in creative mode, give you items"
              }
++            Capability::Gameplay => {
++                "change player inventories, fire projectiles and spawn drivable vehicles"
++            }
 +            Capability::Net => {
 +                "exchange data with its matching component on the game server or clients"
 +            }
          }
      }
      /// The capability a component import needs, `Ok(None)` for one every
-@@ -211,6 +222,7 @@ impl fmt::Display for Capability {
+@@ -211,6 +233,8 @@ impl fmt::Display for Capability {
              Capability::Players => "players",
              Capability::World => "world",
              Capability::Recipes => "recipes",
 +            Capability::Net => "net",
++            Capability::Gameplay => "gameplay",
          };
          f.write_str(name)
      }
-@@ -247,11 +259,9 @@ impl Manifest {
+@@ -247,11 +271,9 @@ impl Manifest {
                  "{MANIFEST}: a server mod is side = \"server\" with api = \"{SERVER_API}\", and only it"
              ));
          }
@@ -583,13 +1817,23 @@ index c2f2f61fc..f4da87dc6 100644
              return Err(format!("{MANIFEST}: capability {c} is for {side} mods"));
          }
 diff --git a/crates/horizon-mods/src/runtime.rs b/crates/horizon-mods/src/runtime.rs
-index cff44722b..08702e91d 100644
+index cff44722b..1dd60ba8e 100644
 --- a/crates/horizon-mods/src/runtime.rs
 +++ b/crates/horizon-mods/src/runtime.rs
-@@ -15,6 +15,11 @@ use wasmtime::{
+@@ -3,7 +3,7 @@ use crate::manifest::{Manifest, Package, Side};
+ use server_bindings::{
+     HorizonServerMod,
+     exports::horizon::mods::server_events::Registration as ServerRegistration,
+-    horizon::mods::{players, world as mod_world},
++    horizon::mods::{gameplay as play_api, players, world as mod_world},
+ };
+ use std::{
+     path::{Path, PathBuf},
+@@ -15,6 +15,12 @@ use wasmtime::{
      component::{Component, HasSelf, Linker},
  };
  
++mod gameplay;
 +mod network;
 +use bindings::horizon::mods::net;
 +pub use bindings::horizon::mods::net::{Event as NetworkEvent, Message as NetworkMessage};
@@ -598,7 +1842,7 @@ index cff44722b..08702e91d 100644
  mod bindings {
      wasmtime::component::bindgen!({
          path: "../horizon-mod-sdk/wit",
-@@ -30,6 +35,7 @@ mod server_bindings {
+@@ -30,6 +36,7 @@ mod server_bindings {
          with: {
              "horizon:mods/log": super::bindings::horizon::mods::log,
              "horizon:mods/storage": super::bindings::horizon::mods::storage,
@@ -606,19 +1850,51 @@ index cff44722b..08702e91d 100644
          },
      });
  }
-@@ -136,6 +142,8 @@ const STORAGE_WRITE_BUDGET: u64 = 1 << 20;
+@@ -51,6 +58,10 @@ use bindings::{
+     exports::horizon::mods::events::Registration,
+     horizon::mods::{chat, command, game, hud, log as mod_log, storage},
+ };
++pub use server_bindings::horizon::mods::gameplay::{
++    Edit as InventoryEdit, PlayerInventory, Projectile as ModProjectile, Stack as InventoryStack,
++    Vehicle as ModVehicle,
++};
+ pub use server_bindings::{
+     exports::horizon::mods::server_events::{
+         Argument, ArgumentKind, ArgumentValue, BlockPos, ServerCommand,
+@@ -75,7 +86,9 @@ mod render_bindings {
+ }
+ use render_bindings::horizon::mods::input;
+ /// Capability `input`'s records (WIT `interface input`).
+-pub use render_bindings::horizon::mods::input::{Event as InputEvent, HeldItem, ItemUse};
++pub use render_bindings::horizon::mods::input::{
++    AttackEvent, Event as InputEvent, HeldItem, ItemUse,
++};
+ /// What capability `render` asks the game to draw (WIT `interface render`).
+ pub use render_bindings::horizon::mods::render::{
+     Corner as RenderCorner, FarTerrain as ModFarTerrain, FillShape, FrameRate, ItemShape,
+@@ -136,6 +149,10 @@ const STORAGE_WRITE_BUDGET: u64 = 1 << 20;
  /// What mods may read of the game, copied once per tick by the game.
  #[derive(Clone, Debug, Default)]
  pub struct Snapshot {
++    pub inventories: Vec<(String, play_api::PlayerInventory)>,
++    pub vehicles: Vec<(String, play_api::Vehicle)>,
 +    /// The local connection announced the mod channel (or is in-frame loopback).
 +    pub network_connected: bool,
      pub player: Option<Player>,
      pub clock: Option<Clock>,
      /// The screen in GUI pixels (capability `render`'s `gui-size`).
-@@ -198,6 +206,15 @@ impl Runs {
+@@ -198,6 +215,23 @@ impl Runs {
  /// What mods asked the game to show since the last [`Mods::drain`].
  #[derive(Clone, Debug, PartialEq)]
  pub enum Output {
++    Gameplay {
++        mod_id: String,
++        edit: play_api::Edit,
++    },
++    VehicleModels {
++        mod_id: String,
++        models: Vec<(u32, String)>,
++    },
 +    /// Authenticated, same-mod traffic. None targets this client's server;
 +    /// Some targets that online player's client. Sending mod id is host-owned.
 +    Network {
@@ -631,7 +1907,7 @@ index cff44722b..08702e91d 100644
      /// `chat.show`: a line after the mod's name.
      Chat { name: String, text: String },
      /// A mod command's feedback, red when `error`.
-@@ -400,6 +417,7 @@ impl BrowserState {
+@@ -400,6 +434,7 @@ impl BrowserState {
  }
  
  struct State {
@@ -639,7 +1915,16 @@ index cff44722b..08702e91d 100644
      name: String,
      id: String,
      snapshot: Arc<Snapshot>,
-@@ -567,13 +585,14 @@ impl Mods {
+@@ -538,6 +573,8 @@ impl Mods {
+             let mut linker = Linker::new(&engine);
+             HorizonMod::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
+                 .map_err(|e| e.to_string())?;
++            play_api::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
++                .map_err(|e| e.to_string())?;
+             players::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
+                 .map_err(|e| e.to_string())?;
+             mod_world::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
+@@ -567,13 +604,14 @@ impl Mods {
          let Some(wasm) = &package.wasm else {
              return Ok(None);
          };
@@ -661,7 +1946,7 @@ index cff44722b..08702e91d 100644
              return Err(format!("another running mod already uses id {}", m.id));
          }
          let server = m.side == Side::Server;
-@@ -608,6 +627,7 @@ impl Mods {
+@@ -608,6 +646,7 @@ impl Mods {
              .join(crate::manifest::STORAGE_DIR)
              .join(&m.id);
          let state = State {
@@ -669,7 +1954,7 @@ index cff44722b..08702e91d 100644
              name: m.name.clone(),
              id: m.id.clone(),
              snapshot,
-@@ -766,6 +786,7 @@ impl Mods {
+@@ -766,6 +805,7 @@ impl Mods {
          let run = entry.run.as_mut()?;
          run.store.data_mut().snapshot = self.snapshot.clone();
          run.store.data_mut().storage_budget = STORAGE_WRITE_BUDGET;
@@ -677,18 +1962,23 @@ index cff44722b..08702e91d 100644
          let started = Instant::now();
          let result = run.store.set_fuel(fuel).and_then(|()| f(run));
          // An average over about the last 64 calls.
-@@ -775,6 +796,10 @@ impl Mods {
+@@ -775,6 +815,15 @@ impl Mods {
              std::mem::take(&mut data.ui.open),
              std::mem::take(&mut data.ui.close),
          );
 +        // A failing hook must not send half of a network transaction.
 +        if result.is_err() {
-+            data.out.retain(|o| !matches!(o, Output::Network { .. }));
++            data.out.retain(|o| {
++                !matches!(
++                    o,
++                    Output::Network { .. } | Output::Gameplay { .. } | Output::VehicleModels { .. }
++                )
++            });
 +        }
          self.out.append(&mut data.out);
          if open {
              self.out.push(Output::OpenScreen { owner: i });
-@@ -869,6 +894,7 @@ impl Mods {
+@@ -869,6 +918,7 @@ impl Mods {
      }
      /// `player` left the server (they are no longer in the snapshot's players).
      pub fn player_left(&mut self, player: &ServerPlayer) {
@@ -696,6 +1986,173 @@ index cff44722b..08702e91d 100644
          self.each_server(
              FUEL_EVENT,
              |h| h.joins,
+@@ -1035,6 +1085,38 @@ impl Mods {
+     pub fn claims(&self, id: &str) -> bool {
+         self.inputs().any(|i| i.claimed.iter().any(|c| c == id))
+     }
++    pub fn gameplay_ids(&self) -> Vec<String> {
++        self.entries
++            .iter()
++            .filter(|e| e.run.is_some())
++            .filter_map(|e| e.manifest.as_ref())
++            .filter(|m| m.capabilities.contains(&crate::Capability::Gameplay))
++            .map(|m| m.id.clone())
++            .collect()
++    }
++    pub fn claims_attack(&self, id: &str) -> bool {
++        self.inputs().any(|i| i.attack.iter().any(|c| c == id))
++    }
++    pub fn attack_input(&mut self, item: &HeldItem, ticks: u32, down: bool) {
++        let value = ItemUse {
++            item: item.clone(),
++            ticks,
++        };
++        let event = if down {
++            AttackEvent::Start(value)
++        } else {
++            AttackEvent::Stop(value)
++        };
++        for run in self.entries.iter_mut().filter_map(|e| e.run.as_mut()) {
++            let input = &mut run.store.data_mut().input;
++            if input.attack.contains(&item.id) {
++                if input.attack_events.len() == INPUT_EVENTS {
++                    input.attack_events.pop_front();
++                }
++                input.attack_events.push_back(event.clone());
++            }
++        }
++    }
+     /// Some running mod registered a key.
+     pub fn has_keys(&self) -> bool {
+         self.inputs().any(|i| !i.keys.is_empty())
+@@ -1627,6 +1709,8 @@ pub struct ModKey {
+ #[derive(Default)]
+ struct InputState {
+     claimed: Vec<String>,
++    attack: Vec<String>,
++    attack_events: std::collections::VecDeque<AttackEvent>,
+     keys: Vec<ModKey>,
+     events: std::collections::VecDeque<InputEvent>,
+     /// The mod's keys held now, by name.
+@@ -1676,6 +1760,12 @@ impl InputState {
+ }
+ 
+ impl input::Host for State {
++    fn poll_attack(&mut self) -> Vec<AttackEvent> {
++        self.input.attack_events.drain(..).collect()
++    }
++    fn claim_attack(&mut self, ids: Vec<String>) {
++        self.input.attack = ids.into_iter().take(CLAIMS).map(clip).collect();
++    }
+     fn claim_items(&mut self, ids: Vec<String>) {
+         self.input.claimed = ids.into_iter().take(CLAIMS).map(clip).collect();
+     }
+@@ -1774,6 +1864,9 @@ fn clip_shapes(shapes: Vec<Shape>) -> Vec<Shape> {
+ }
+ 
+ impl render::Host for State {
++    fn set_vehicle_models(&mut self, models: Vec<render::VehicleModel>) {
++        self.vehicle_models(models);
++    }
+     fn set_hud(&mut self, shapes: Vec<Shape>) {
+         self.shapes = clip_shapes(shapes);
+     }
+diff --git a/crates/horizon-mods/src/runtime/gameplay.rs b/crates/horizon-mods/src/runtime/gameplay.rs
+new file mode 100644
+index 000000000..3f3bf9aea
+--- /dev/null
++++ b/crates/horizon-mods/src/runtime/gameplay.rs
+@@ -0,0 +1,90 @@
++//! Deferred, bounded server gameplay writes. The game revalidates every
++//! precondition against its live inventory before applying an edit.
++use super::{Output, State, play_api, render};
++impl play_api::Host for State {
++    fn inventories(&mut self) -> Vec<play_api::PlayerInventory> {
++        self.snapshot
++            .inventories
++            .iter()
++            .filter(|(id, _)| id == &self.id)
++            .map(|(_, p)| play_api::PlayerInventory {
++                player: p.player.clone(),
++                stacks: p
++                    .stacks
++                    .iter()
++                    .map(|s| play_api::Stack {
++                        slot: s.slot,
++                        item: s.item.clone(),
++                        count: s.count,
++                        selected: s.selected,
++                        state: s.state.clone(),
++                    })
++                    .collect(),
++            })
++            .collect()
++    }
++    fn vehicles(&mut self) -> Vec<play_api::Vehicle> {
++        self.snapshot
++            .vehicles
++            .iter()
++            .filter(|(id, _)| id == &self.id)
++            .map(|(_, v)| v.clone())
++            .collect()
++    }
++    fn commit(&mut self, edit: play_api::Edit) -> Result<(), String> {
++        let owned = |id: &str| id.starts_with(&format!("{}:", self.id));
++        if self
++            .out
++            .iter()
++            .filter(|o| matches!(o, Output::Gameplay { .. }))
++            .count()
++            >= 16
++        {
++            return Err("at most 16 gameplay edits per hook".into());
++        }
++        if edit.slot > 8
++            || !owned(&edit.item)
++            || edit.expected.len() > 4096
++            || edit.state.len() > 4096
++            || edit.consume > 4096
++            || (edit.consume > 0 && !owned(&edit.ammo))
++            || edit.vehicle.as_ref().is_some_and(|v| v.len() > 16384)
++            || edit.shot.as_ref().is_some_and(|p| {
++                !p.speed.is_finite()
++                    || !(0.1..=32.).contains(&p.speed)
++                    || !p.damage.is_finite()
++                    || !(0. ..=1000.).contains(&p.damage)
++                    || !p.inaccuracy.is_finite()
++                    || !(0. ..=30.).contains(&p.inaccuracy)
++            })
++        {
++            return Err("invalid gameplay edit".into());
++        }
++        if !self
++            .snapshot
++            .players
++            .iter()
++            .any(|p| p.id == edit.player && p.health > 0.)
++        {
++            return Err("player is not alive and online".into());
++        }
++        self.out.push(Output::Gameplay {
++            mod_id: self.id.clone(),
++            edit,
++        });
++        Ok(())
++    }
++}
++impl State {
++    pub(super) fn vehicle_models(&mut self, models: Vec<render::VehicleModel>) {
++        self.out.push(Output::VehicleModels {
++            mod_id: self.id.clone(),
++            models: models
++                .into_iter()
++                .take(64)
++                .filter(|v| v.profile.len() <= 16384)
++                .map(|v| (v.entity, v.profile))
++                .collect(),
++        });
++    }
++}
 diff --git a/crates/horizon-mods/src/runtime/network.rs b/crates/horizon-mods/src/runtime/network.rs
 new file mode 100644
 index 000000000..7cc25fd3a
@@ -1423,7 +2880,7 @@ index 000000000..b15dacd5d
 +    );
 +}
 diff --git a/crates/horizon-mods/tests/sandbox.rs b/crates/horizon-mods/tests/sandbox.rs
-index e400dd56b..1004b64d2 100644
+index e400dd56b..e1957f4d7 100644
 --- a/crates/horizon-mods/tests/sandbox.rs
 +++ b/crates/horizon-mods/tests/sandbox.rs
 @@ -205,7 +205,7 @@ fn undeclared_capabilities_are_refused() {
@@ -1446,18 +2903,91 @@ index e400dd56b..1004b64d2 100644
  "#;
      std::fs::write(dir.join("horizon-mod.toml"), manifest).unwrap();
      std::fs::write(dir.join("mod.wasm"), wasm).unwrap();
-@@ -256,7 +256,10 @@ experimental = ["ui", "render", "input", "recipes"]
+@@ -255,8 +255,11 @@ experimental = ["ui", "render", "input", "recipes"]
+         needed(imports(&wasm).unwrap().iter().map(String::as_str)).0
      };
      assert_eq!(level("coords_hud.hmod"), 0);
-     // The UI guest draws far terrain (`render.set-far-terrain`).
+-    // The UI guest draws far terrain (`render.set-far-terrain`).
 -    assert_eq!(level("horizon_mods_test_ui_guest.hmod"), LEVEL);
++    // The UI guest claims attack input and polls its separate events.
 +    assert_eq!(
 +        level("horizon_mods_test_ui_guest.hmod"),
-+        level_of("render.set-far-terrain").unwrap()
++        level_of("input.poll-attack").unwrap()
 +    );
  }
  
  #[test]
+@@ -620,6 +623,42 @@ fn input_claims_keys_and_events() {
+     assert_eq!(chat(&mut mods), ["key-down wheel", "key-up wheel"]);
+ }
+ 
++#[test]
++fn attack_claims_are_separate_from_use_and_route_to_the_claimant() {
++    let mut mods = load("horizon_mods_test_ui_guest.hmod");
++    assert!(!mods.claims_attack("minecraft:stick"));
++    assert!(mods.command("input_claim"));
++    mods.drain();
++    assert!(mods.claims_attack("minecraft:stick"));
++    assert!(!mods.claims_attack("minecraft:diamond"));
++    let item = horizon_mods::HeldItem {
++        id: "minecraft:stick".into(),
++        count: 1,
++        slot: 0,
++    };
++    mods.attack_input(&item, 0, true);
++    mods.attack_input(&item, 4, false);
++    assert!(mods.command("input_poll"));
++    let lines: Vec<_> = mods
++        .drain()
++        .into_iter()
++        .filter_map(|o| {
++            if let Output::Chat { text, .. } = o {
++                Some(text)
++            } else {
++                None
++            }
++        })
++        .collect();
++    assert_eq!(
++        lines,
++        [
++            "attack-start minecraft:stick 0",
++            "attack-stop minecraft:stick 4"
++        ]
++    );
++}
++
+ #[test]
+ fn the_players_key_choice_wins() {
+     let chat = |mods: &mut Mods| -> Vec<String> {
+diff --git a/crates/horizon-mods/tests/ui_guest/src/lib.rs b/crates/horizon-mods/tests/ui_guest/src/lib.rs
+index f95aedffa..5531ddcca 100644
+--- a/crates/horizon-mods/tests/ui_guest/src/lib.rs
++++ b/crates/horizon-mods/tests/ui_guest/src/lib.rs
+@@ -185,12 +185,23 @@ impl Mod for Guest {
+             }
+             "input_claim" => {
+                 input::claim_items(&["minecraft:stick".into()]);
++                input::claim_attack(&["minecraft:stick".into()]);
+                 input::register_key("wheel", "Open the wheel", "key.keyboard.r")?;
+                 // Not a key: refused.
+                 let bad = input::register_key("bad", "Bad", "R").unwrap_err();
+                 chat::show(&format!("claimed; {bad}"));
+             }
+             "input_poll" => {
++                for event in input::poll_attack() {
++                    chat::show(&match event {
++                        input::AttackEvent::Start(u) => {
++                            format!("attack-start {} {}", u.item.id, u.ticks)
++                        }
++                        input::AttackEvent::Stop(u) => {
++                            format!("attack-stop {} {}", u.item.id, u.ticks)
++                        }
++                    });
++                }
+                 for event in input::poll() {
+                     chat::show(&match event {
+                         Event::UseStart(u) => format!("use-start {} {}", u.item.id, u.ticks),
 diff --git a/crates/horizon-protocol/src/lib.rs b/crates/horizon-protocol/src/lib.rs
 index 299688560..de5cca665 100644
 --- a/crates/horizon-protocol/src/lib.rs
@@ -1560,15 +3090,82 @@ index 000000000..10c9ee799
 +        assert!(decode(&vec![0; MAX_DATA + MAX_ID + 3]).is_err());
 +    }
 +}
+diff --git a/docs/api/gameplay.md b/docs/api/gameplay.md
+new file mode 100644
+index 000000000..2e8473155
+--- /dev/null
++++ b/docs/api/gameplay.md
+@@ -0,0 +1,60 @@
++# Experimental mod gameplay (API level 9)
++
++Server mods opt into `gameplay` on API 0.3. `inventories()` exposes native slots,
++selected slot and **only the calling mod's** persistent item bytes. The bytes live
++in `minecraft:custom_data.horizon_mod_state.<mod-id>`, preserving other custom
++components and other mods' data through saves, containers, drops and packets.
++
++`commit(edit)` queues an atomic edit. **Ok means queued**, not applied. After the
++hook succeeds, the game rechecks the living player, selected slot, single item,
++expected bytes, ammunition and (when placing a vehicle) world collision. A failed
++condition changes nothing and spawns nothing. Observe the new bytes in the next
++inventory snapshot before presenting a committed action. At most 16 edits per
++hook, 4096 bytes per stack; item and ammunition ids must belong to the mod.
++
++A projectile edit spawns a native arrow projectile using the player's authoritative
++view, owner and dimension. The host bounds speed, damage and spread; the mod never
++accepts client hit reports. Native collision, armor, shields, damage attribution,
++PvP rules and entity tracking apply. These are arrow ballistics and presentation,
++not a custom bullet renderer or an armor penetration system.
++
++A vehicle edit consumes the held item and places a native passenger entity at the
++player's placement ray. Its `vehicle` string is a JSON ground chassis profile:
++
++```json
++{
++  "definition": "example:car", "item": "example:car",
++  "width": 2.0, "length": 3.2, "height": 1.6, "seat_height": 0.85, "seat_z": 0.0,
++  "acceleration": 0.035, "drag": 0.96, "max_speed": 0.65,
++  "turn_speed": 3.0, "max_health": 175.0,
++  "boxes": [{"min": [-0.8, 0.3, -1.5], "max": [0.8, 0.8, 1.5], "color": 4281553988}]
++}
++```
++
++Distances and velocity are blocks and blocks/tick; acceleration is per tick, drag
++is a multiplier, steering is degrees/tick. Bounds: width 0.5–6, length 0.5–8,
++height 0.3–5, acceleration 0.001–0.2, drag 0.5–0.999, speed 0.01–2,
++turn 0.1–10, health 1–10000; 1–64 cuboids with finite coordinates within ±8.
++`seat_z` optionally moves the seat along the local chassis (default 0, within half
++the length). Colors store red in the low byte and alpha in the high byte. JSON is at most 16 KiB.
++
++The chassis has gravity, swept block and vehicle collision, a 0.6 block step,
++one player seat, native mount/dismount and native chunk persistence. It does not
++float, fly, burn fuel or simulate wheels/suspension. The server drives it from the
++authenticated passenger's vanilla input flags. Client vehicle position packets
++cannot move it. Without input it coasts to a stop. Profiles, owner and health save
++under `HorizonModVehicle` in the native entity's NBT. Native tracking uses the boat
++wire entity type; matching Horizon clients receive the mod's visual profile.
++
++`vehicles()` lists the calling mod's native vehicles across loaded dimensions.
++Mods transport profiles over their own authenticated `net` channel. Client
++`render.set-vehicle-models` binds profiles to native entity ids for rendering and
++passenger prediction; it cannot override a server's authoritative profile. Bindings
++are full replacements, at most 64, and draw simple shaded cuboids. Client models
++are cosmetic. No mod-specific tuning or weapon rules live in the engine.
++
++`input.claim-attack` takes attack clicks for the listed items, emitting
++start/stop transitions via `input.poll-attack` and suppressing mining and melee. Screen changes or
++changing the selected item release a held claim. Existing `claim-items` continues
++to claim the use button separately. Server mods must still validate the selected
++item and impose a short trigger lease; input events grant no damage authority.
 diff --git a/docs/api/mods-reference.md b/docs/api/mods-reference.md
-index b25ef5b9e..fb3a4d1f5 100644
+index b25ef5b9e..48ea94c43 100644
 --- a/docs/api/mods-reference.md
 +++ b/docs/api/mods-reference.md
-@@ -19,26 +19,27 @@ The contract between Horizon and its mods: the WIT package `horizon:mods@0.1.0`,
+@@ -19,26 +19,28 @@ The contract between Horizon and its mods: the WIT package `horizon:mods@0.1.0`,
  | `players` | [`players`](#players) | see who is on the server and message them |
  | `world` | [`world`](#world) | read and change the world's blocks |
  | `recipes` | [`recipes`](#recipes) | read the game's recipes and items and which recipes you know, place recipes in your crafting grid and, in creative mode, give you items |
 +| `net` | [`net`](#net) | exchange data with its matching component on the game server or clients |
++| `gameplay` | [`gameplay`](#gameplay) | change player inventories, fire projectiles and spawn drivable vehicles |
  
  ## World `horizon-mod`
  
@@ -1583,7 +3180,7 @@ index b25ef5b9e..fb3a4d1f5 100644
  A server mod (manifest `side = "server"`, `api = "0.3"`, experimental): runs where the world is simulated, on the dedicated server, a LAN host and single player's own server.
  
 -- Imports (what the game offers): `log`, `storage`, `players`, `world`
-+- Imports (what the game offers): `log`, `storage`, `players`, `world`, `net`
++- Imports (what the game offers): `gameplay`, `log`, `storage`, `players`, `world`, `net`
  - Exports (what the mod provides): `server-events`
  
  ## World `horizon-ui-mod`
@@ -1595,7 +3192,52 @@ index b25ef5b9e..fb3a4d1f5 100644
  - Exports (what the mod provides): `ui-events`, `events`
  
  ## World `ui-host`
-@@ -768,3 +769,40 @@ An argument's value, parsed as its kind says.
+@@ -301,6 +303,13 @@ The main hand's stack.
+ | `key-up` | `string` |  |
+ | `wheel` | `f32` | Mouse wheel steps while the mod holds the wheel (`claim-wheel`): positive away from the player, as the hotbar reads them. |
+ 
++### variant `attack-event`
++
++| Case | Payload | |
++| --- | --- | --- |
++| `start` | `item-use` |  |
++| `stop` | `item-use` |  |
++
+ ### record `mapping-state`
+ 
+ A mapping as the player has bound it.
+@@ -313,6 +322,8 @@ A mapping as the player has bound it.
+ | Function | Signature | What it does |
+ | --- | --- | --- |
+ | `claim-items` | `func(ids: list<string>)` | The items whose use the mod handles instead of the game, by id (at most 64). Replaces the previous list. |
++| `claim-attack` | `func(ids: list<string>)` | Claim the attack button too: prevents mining and melee with these items. |
++| `poll-attack` | `func() -> list<attack-event>` | Claimed attack transitions, oldest first, separately from legacy use/key events. |
+ | `register-key` | `func(name: string, label: string, key: string) -> result<_, string>` | A key of the mod's: `name` comes back in `key-down` and `key-up`, `label` says what it does, `key` is the key as options.txt writes it (`key.keyboard.r`), the default: the player can bind another one on the mod's page in Options > Mods, and that one wins. At most 16; an unknown key is an error. |
+ | `held` | `func() -> option<held-item>` | The main hand's stack, as of this tick; none when it is empty. |
+ | `poll` | `func() -> list<event>` | The events since the last call, oldest first. |
+@@ -442,6 +453,13 @@ Any four-cornered shape (a wheel's segment, an arrow): the corners in order roun
+ | `distance` | `u32` | How far the distant terrain reaches, in chunks: 64 to 1024. On integrated graphics other than Apple's the game caps it lower. |
+ | `reduced` | `bool` | Coarser far tiles, as the Far Detail setting's Reduced: 2 to 4 ms less GPU time per frame on integrated graphics. |
+ 
++### record `vehicle-model`
++
++| Field | Type | |
++| --- | --- | --- |
++| `entity` | `u32` |  |
++| `profile` | `string` |  |
++
+ | Function | Signature | What it does |
+ | --- | --- | --- |
+ | `set-hud` | `func(shapes: list<shape>)` | Replaces the mod's HUD shapes: up to 1024, drawn every frame in order over the HUD (after the hotbar, under chat and screens), hidden with the HUD (F1). An empty list removes them. |
+@@ -454,6 +472,7 @@ Any four-cornered shape (a wheel's segment, an arrow): the corners in order roun
+ | `set-zoom` | `func(zoom: zoom)` | Zooms the camera until the next call (`factor` 1 ends it), only while playing: a screen opening or the spyglass's own view (which wins) leave the camera vanilla's. With several mods, the strongest zoom counts. |
+ | `set-minimap` | `func(minimap: option<minimap>)` | Shows a map of the world around the player in `corner`, stacked with the game's overlays and the mods' panels, until the next call (none hides it). It looks like a map item: vanilla's map colours with their height shading and water depth, and the player's arrow. Underground, under a roof and in the Nether it maps the floor around the player's height. The game keeps the map's tiles and refreshes them within its own frame budget; hidden, they are dropped. One map shows at a time: the first loaded mod's. |
+ | `set-far-terrain` | `func(far-terrain: option<far-terrain>)` | Draws the world beyond the render distance as distant terrain, out to `distance` chunks, until the next call (none ends it). The game builds it on its own workers, from the chunks already loaded or saved and, where nobody has been, from the world's generator; the simulation distance doesn't change. Only worlds whose generator the game has (single player and a LAN world you host) show it. The player's own LOD Distance setting, when on, wins. One far terrain shows at a time: the first loaded mod's. |
++| `set-vehicle-models` | `func(models: list<vehicle-model>)` | Bind generic cuboid vehicle profiles to native entity ids. Replaces this mod's bindings (at most 64). JSON schema: docs/api/gameplay.md. Cosmetic on clients; server physics always uses its own profile. |
+ 
+ ## `events`
+ 
+@@ -768,3 +787,107 @@ An argument's value, parsed as its kind says.
  | `command` | `func(player: player, name: string, args: string, values: list<tuple<string, argument-value>>) -> result<option<string>, string>` | `/name args` typed by `player`: ok(some(text)) is their feedback, err(text) their error in red. `values` holds each argument given, by name, in order (an optional one left out isn't there); a line that doesn't parse never reaches the mod: the player gets vanilla's error. |
  | `block-broken` | `func(player: player, pos: block-pos, state: string)` | A player broke the block at `pos` in their dimension: `state` is what was there, as `minecraft:oak_log[axis=y]`. |
  | `block-placed` | `func(player: player, pos: block-pos, state: string)` | A player placed `state` at `pos` in their dimension. |
@@ -1636,6 +3278,73 @@ index b25ef5b9e..fb3a4d1f5 100644
 +| `session-token` | `func(player: string) -> option<session>` | Server only: fresh token for this player's current authenticated connection, available after its first received message. None elsewhere. |
 +| `send` | `func(player: option<string>, data: list<u8>) -> result<_, string>` | Client: player must be none, sends to its server. Server: player must name an online player's UUID. Host supplies the sending mod id and authenticates players; bytes never select their sender. At most 16 KiB per message and 8 messages per hook. An error queues nothing. |
 +| `poll` | `func() -> list<event>` | Events in arrival order. Bounded to 64 events / 256 KiB; no polling does not grant unbounded memory. Disconnect clears old queued messages. |
++
++## `gameplay`
++
++Access: capability `gameplay`.
++
++Experimental server capability: authoritative inventory transactions and generic rideable ground vehicles. All writes are deferred until the hook succeeds. Re-read inventory next tick to observe a committed write.
++
++### record `stack`
++
++| Field | Type | |
++| --- | --- | --- |
++| `slot` | `u32` |  |
++| `item` | `string` |  |
++| `count` | `u32` |  |
++| `selected` | `bool` |  |
++| `state` | `list<u8>` |  |
++
++### record `player-inventory`
++
++| Field | Type | |
++| --- | --- | --- |
++| `player` | `string` |  |
++| `stacks` | `list<stack>` |  |
++
++### record `projectile`
++
++| Field | Type | |
++| --- | --- | --- |
++| `speed` | `f32` |  |
++| `damage` | `f32` |  |
++| `inaccuracy` | `f32` |  |
++
++### record `edit`
++
++| Field | Type | |
++| --- | --- | --- |
++| `player` | `string` |  |
++| `slot` | `u32` |  |
++| `item` | `string` |  |
++| `expected` | `list<u8>` |  |
++| `state` | `list<u8>` |  |
++| `ammo` | `string` |  |
++| `consume` | `u32` |  |
++| `shot` | `option<projectile>` |  |
++| `vehicle` | `option<string>` | A validated JSON vehicle profile. Consumes the held item on success. |
++
++### record `vehicle`
++
++| Field | Type | |
++| --- | --- | --- |
++| `entity` | `u32` |  |
++| `definition` | `string` |  |
++| `dimension` | `string` |  |
++| `profile` | `string` |  |
++| `x` | `f64` |  |
++| `y` | `f64` |  |
++| `z` | `f64` |  |
++| `yaw` | `f32` |  |
++| `vx` | `f64` |  |
++| `vy` | `f64` |  |
++| `vz` | `f64` |  |
++
++| Function | Signature | What it does |
++| --- | --- | --- |
++| `inventories` | `func() -> list<player-inventory>` | Per-mod item state and slots for the online players, as of this tick. |
++| `vehicles` | `func() -> list<vehicle>` | Native vehicles owned by this mod across loaded dimensions. |
++| `commit` | `func(edit: edit) -> result<_, string>` | Queue an atomic compare/exchange: selected stack must still match; ammunition, item state and projectile/spawn either all commit or none. Ok means queued. The next inventory snapshot confirms application. |
 diff --git a/docs/api/mods.md b/docs/api/mods.md
 index 0dc74e7a3..a43b11cb1 100644
 --- a/docs/api/mods.md
@@ -1650,7 +3359,7 @@ index 0dc74e7a3..a43b11cb1 100644
  - **Keys and the crosshair target**: keybinds in Controls; what the player is looking at.
  - **Script mods and other languages**: see [Ways in](#ways-in).
 diff --git a/docs/api/stability.md b/docs/api/stability.md
-index 765034b3d..28681eab6 100644
+index 765034b3d..57df4e6f9 100644
 --- a/docs/api/stability.md
 +++ b/docs/api/stability.md
 @@ -38,7 +38,7 @@ don't import it); faster, or fixing behaviour to what the reference already says
@@ -1658,15 +3367,15 @@ index 765034b3d..28681eab6 100644
  A new WIT function doesn't break older mods, but a mod that calls it can't run on a Horizon from before it. So every
  function the game offers mods has an **API level**, the one it arrived at (`crates/horizon-mods/src/api_level.rs`):
 -level 0 is the contract of Horizon 0.2.67 to 0.2.69, level 1 adds `render.set-minimap` and server mods' `players`, level 2 `game.raycast`, level 3 `command.run-quiet`, level 4 server mods' `world`, level 5 `recipes` (`items`, `all`, `known`), level 6 `browser` (`set-items`, `poll`, `set-recipes`) and `recipes.place` and `recipes.give`, level 7 `render.set-far-terrain`. A mod needs the level of
-+level 0 is the contract of Horizon 0.2.67 to 0.2.69, level 1 adds `render.set-minimap` and server mods' `players`, level 2 `game.raycast`, level 3 `command.run-quiet`, level 4 server mods' `world`, level 5 `recipes` (`items`, `all`, `known`), level 6 `browser` (`set-items`, `poll`, `set-recipes`) and `recipes.place` and `recipes.give`, level 7 `render.set-far-terrain`, and level 8 the experimental `net` channel. A mod needs the level of
++level 0 is the contract of Horizon 0.2.67 to 0.2.69, level 1 adds `render.set-minimap` and server mods' `players`, level 2 `game.raycast`, level 3 `command.run-quiet`, level 4 server mods' `world`, level 5 `recipes` (`items`, `all`, `known`), level 6 `browser` (`set-items`, `poll`, `set-recipes`) and `recipes.place` and `recipes.give`, level 7 `render.set-far-terrain`, level 8 the experimental `net` channel, and level 9 `gameplay`, `input.claim-attack`/`poll-attack` and `render.set-vehicle-models`. A mod needs the level of
  the newest function it imports (a component imports only the functions it calls). The level is read from the file,
  never declared:
  
 diff --git a/docs/mods.md b/docs/mods.md
-index aad279866..68cd1d701 100644
+index aad279866..8fc125851 100644
 --- a/docs/mods.md
 +++ b/docs/mods.md
-@@ -121,10 +121,40 @@ loading. Ordered by what the first native ports need:
+@@ -121,10 +121,45 @@ loading. Ordered by what the first native ports need:
  | `render` (world) | world-space lines, boxes and billboards, beside the HUD shapes `render` has | Litematica-style placement, waypoints |
  | `registries` | new blocks, items, entities and recipes, mostly data: JSON models, textures, loot and recipes in the `.hmod`'s `assets/` and `data/` | server side; see [Multiplayer](#multiplayer) |
  | `server` | world events (entity spawn/death), game rules, world read/write, typed server commands | after [server mods 0.3](#server-mods-api-03-experimental)'s players, chat, blocks and commands |
@@ -1675,6 +3384,11 @@ index aad279866..68cd1d701 100644
  
  There is no file, socket, process or raw-input interface, on purpose.
  
++### Mod gameplay (experimental, API level 9)
++
++Server inventory transactions, native projectile spawning, ground vehicle profiles
++and claimed attack input are described in [the gameplay API](api/gameplay.md).
++
 +### Mod channels (experimental, API level 8)
 +
 +`capabilities = ["net"]` and `experimental = ["net"]` enable a private channel

@@ -10,6 +10,7 @@ horizon-mods.workspace = true
 sbw-contract.workspace = true
 
 [dev-dependencies]
+sbw-sim.workspace = true
 horizon-mods = { workspace = true, features = ["runtime"] }
 
 [lints]

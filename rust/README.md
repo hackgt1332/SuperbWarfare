@@ -1,23 +1,21 @@
 # SuperbWarfare Rust contract
 
-This workspace starts the Horizon port with a buildable contract, before gameplay.
-The component ABI is `superbwarfare:contract@0.2.0` in
-[`contract.wit`](crates/sbw-contract/wit/contract.wit). Rust data types, client imports,
-server imports and guest export traits are generated from that file. There is no
-second handwritten representation of the same messages.
+The WIT component ABI is `superbwarfare:contract@0.3.0` in
+[`contract.wit`](crates/sbw-contract/wit/contract.wit). Shared Rust types, validation,
+wire codecs and session guards are generated from or implement that contract.
 
-**Status:** proposed adapter API, tested independently. Unmodified Horizon at
-`56f968e11c7627536cb6a83420caddce7e3acb8f` cannot link these interfaces. This is not a
-playable `.hmod` and does not change either game's behavior. The reference mod is
-SuperbWarfare `d7b608fa9692d4373d5f9875c276eb871130e37d` (Forge 1.20.1); the target
-engine is Horizon's Minecraft 26.3 implementation.
+**Current implementation:** the [`Horizon gameplay adapter`](horizon-bridge/README.md)
+adds an AK-47, Glock 17 and drivable pickup and cargo truck prototypes to the patched local Horizon engine.
+The standalone `sbw-sim` crate owns weapon rules and saved state. Horizon supplies
+atomic inventory edits, native projectile hits, passengers, collision and vehicle
+persistence. See the adapter README for builds, controls and current limits.
 
-The first executable adapter is now in [`horizon-bridge`](horizon-bridge/README.md).
-It uses Horizon's existing component worlds plus an experimental `net`
-capability to carry this contract's packet protocol. The full custom worlds
-remain proposed: item transactions, entities, damage and rendering are not
-implemented by this transport adapter. ABI 0.2 adds a server host session-token
-accessor; the packet protocol and wire bytes remain 0.1 / format 1.
+The custom `client` and `server` WIT worlds below remain the proposed complete
+port boundary. The working adapter uses Horizon's native worlds and experimental
+`net`/`gameplay` APIs with these same packet types. Unmodified Horizon at baseline
+`56f968e11c7627536cb6a83420caddce7e3acb8f` needs the bundled engine patch.
+ABI 0.3 and protocol 0.2 add a selected-slot vehicle deployment intent. The outer
+wire framing stays format 1; old peers fail version/content negotiation.
 
 ## Build and verify
 
@@ -186,7 +184,7 @@ confirmation; only authoritative state/effects establish what happened.
 
 ## Versions, units and bounds
 
-The WIT package version (`0.2.0`), gameplay protocol (`0.1`), wire format (`1`),
+The WIT package version (`0.3.0`), gameplay protocol (`0.2`), wire format (`1`),
 opaque-state schema and future Horizon manifest API are independent. Do not claim
 that a `0.3` Horizon manifest can load this contract. Pre-1.0 protocol versions
 must match exactly. A wire shape, field order or enum order change needs a new

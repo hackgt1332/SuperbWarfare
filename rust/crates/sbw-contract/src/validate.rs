@@ -139,6 +139,7 @@ impl Validate for Input {
         self.session.validate()?;
         require(self.sequence > 0, "input sequence")?;
         match &self.intent {
+            Intent::DeployVehicle(slot) => require(*slot <= 8, "deploy slot"),
             Intent::Weapon(v) => v.target.validate(),
             Intent::Vehicle(v) => {
                 v.target.validate()?;

@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "IGI",
+    "III",
+    "C C"
+  ],
+  "key": {
+    "I": "minecraft:iron_block",
+    "G": "minecraft:glass",
+    "C": "minecraft:coal_block"
+  },
+  "result": {
+    "id": "superbwarfare:sodayo_pick_up",
+    "count": 1
+  }
+}

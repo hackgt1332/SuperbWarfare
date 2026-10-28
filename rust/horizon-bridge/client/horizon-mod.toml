@@ -1,7 +1,7 @@
 id = "superbwarfare"
-name = "SuperbWarfare transport probe (client)"
+name = "SuperbWarfare Horizon gameplay (client)"
 version = "0.1.0"
-api = "0.1"
+api = "0.2"
 side = "client"
-capabilities = ["net"]
-experimental = ["net"]
+capabilities = ["net", "input", "hud", "render", "command", "registries"]
+experimental = ["net", "input", "render"]

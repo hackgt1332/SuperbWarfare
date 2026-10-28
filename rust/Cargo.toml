@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sbw-contract"]
+members = ["crates/sbw-contract", "crates/sbw-sim"]
 exclude = ["horizon-bridge"]
 resolver = "2"
 

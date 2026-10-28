@@ -9,6 +9,8 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+sbw-sim.workspace = true
+serde_json.workspace = true
 sbw-contract.workspace = true
 horizon-mod-sdk.workspace = true
 

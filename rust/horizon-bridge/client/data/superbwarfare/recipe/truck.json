@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "III",
+    "IPI",
+    "C C"
+  ],
+  "key": {
+    "I": "minecraft:iron_block",
+    "P": "superbwarfare:sodayo_pick_up",
+    "C": "minecraft:coal_block"
+  },
+  "result": {
+    "id": "superbwarfare:truck",
+    "count": 1
+  }
+}
