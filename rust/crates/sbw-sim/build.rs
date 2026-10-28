@@ -3,6 +3,11 @@ fn main() {
     let mut hash = Sha256::new();
     for path in [
         "src/lib.rs",
+        "src/attachments.rs",
+        "src/ballistics.rs",
+        "src/catalog.rs",
+        "src/vehicle_resources.rs",
+        "src/vehicle_weapons.rs",
         "src/pickup.json",
         "src/truck.json",
         "../sbw-contract/wit/contract.wit",

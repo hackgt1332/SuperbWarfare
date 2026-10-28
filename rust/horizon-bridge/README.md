@@ -1,4 +1,4 @@
-# SuperbWarfare for Horizon: first gameplay slice
+# SuperbWarfare for Horizon: guns and ground vehicles
 
 This Rust/WASM port implements **AK-47**, **Glock 17**, ammunition, and a drivable
 **Sodayo pickup and cargo truck prototypes**. It requires the bundled Horizon engine patch.
@@ -10,9 +10,12 @@ update the held gun and create a native projectile. Clients send button intents,
 never damage, hit reports, magazine counts or aim positions. Item swaps, stale
 state, replayed packets, mismatched content and reconnects are checked.
 
-Both vehicles have a shaded cuboid prototype model, one driver seat, acceleration,
-steering, gravity, block/vehicle collision, health, projectile damage, native
-passengers and chunk saves. The server moves it from authenticated movement
+Guns use converted, textured 3D models with a smooth iron-sight transition,
+whole-weapon recoil and a reload progress bar. Both vehicles use converted original
+textured geometry with animated wheels, one driver seat, acceleration, braking
+before reverse, steering, gravity, block/vehicle collision, health, projectile
+damage, native passengers and chunk saves. Deployment checks solid upward ground,
+support across the footprint and chassis clearance before consuming the item. The server moves it from authenticated movement
 inputs and ignores client vehicle position packets. Item state, vehicle profile,
 and vehicle damage survive native saves. Native tracking uses the boat wire type;
 the matching client component supplies the vehicle appearance.
@@ -31,7 +34,7 @@ cargo build --manifest-path ../horizon/Cargo.toml --locked -p horizon-client --f
 ./rust/horizon-bridge/build.sh
 ```
 
-The engine changes are committed locally at `d93cd7d74` on `sbw/mod-network`.
+The engine changes are maintained locally on `sbw/mod-network`.
 The local `/Users/dan/code/horizon` checkout already contains the patch; skip both
 `git apply` commands there. The filename covers both the networking foundation
 and the new gameplay support. Build outputs:
@@ -47,9 +50,9 @@ no Mojang files are included here.
 
 ## Play
 
-The prepared resources are currently missing from this checkout. Install/play your
-own Minecraft 26.3 client once and obtain the matching server jar. With JDK 25
-available, prepare them from `/Users/dan/code/horizon`:
+Use your launcher's prepared Minecraft 26.3 resources if available. Otherwise,
+install/play your own Minecraft 26.3 client once and obtain the matching server
+jar. With JDK 25 available, prepare them from the Horizon checkout:
 
 ```sh
 target/debug/horizon-prepare --root "$PWD" --prepare --server-jar "/path/to/26.3-server.jar"
@@ -60,10 +63,19 @@ The tool reads your own installation and writes `.local/horizon-client/26.3`.
 Then launch an isolated test world from the Horizon directory:
 
 ```sh
-HORIZON_HOME="$PWD/.local/sbw-test" target/debug/horizon-client --world SuperbWarfareTest --creative \
-  --resources .local/horizon-client/26.3 \
-  --dev-mod ../SuperbWarfare/rust/target/horizon-bridge/superbwarfare-client.hmod \
-  --dev-mod ../SuperbWarfare/rust/target/horizon-bridge/superbwarfare-server.hmod
+scratch=$(mktemp -d)
+engine="$PWD"
+mkdir -p "$scratch/game"
+(
+cd "$scratch/game"
+HORIZON_HOME="$scratch/game" HORIZON_LAUNCHER_HOME="$scratch/launcher" \
+XDG_DATA_HOME="$scratch/data" XDG_CONFIG_HOME="$scratch/config" \
+HORIZON_LAUNCHER_NO_SELF_UPDATE=1 HORIZON_NO_AUDIO=1 \
+"$engine/target/debug/horizon-client" --world SuperbWarfareTest --creative \
+  --resources "$engine/.local/horizon-client/26.3" \
+  --dev-mod "$engine/../SuperbWarfare/rust/target/horizon-bridge/superbwarfare-client.hmod" \
+  --dev-mod "$engine/../SuperbWarfare/rust/target/horizon-bridge/superbwarfare-server.hmod"
+)
 ```
 
 Create a separate test world. In chat, use `/sbw_status` to check negotiation,
@@ -94,8 +106,9 @@ recipes provide access while the original machines/materials have not been porte
 ## Current limits
 
 This is an initial implementation of two guns and two ground vehicles, not the
-complete arsenal. Weapon display uses the mod's item icons; the vehicles use a
-simple new cuboid model. Native arrow ballistics/rendering and damage rules stand
+complete arsenal. The models are static conversions with cosmetic wheel steering/rolling
+and whole-weapon pose animation; original bone reload/fire animations, hands and
+attachments are not yet ported. Native arrow ballistics/rendering and damage rules stand
 in for custom bullets. Headshot multipliers, custom penetration, gun animations,
 attachments, sounds, fuel, vehicle weapons, multiple seats, aircraft, machines,
 and the remaining guns/vehicles are still outstanding. Reload cancellation is
@@ -106,8 +119,15 @@ Transport is bounded: 16 KiB packets, eight sends per hook, 64 queued requests,
 32 accepted inputs per player/server tick, connection-bound tokens and full
 replacement snapshots. Triggers and aim expire after ten ticks without a heartbeat. Re-equipping a gun
 changes its input generation, so a delayed click cannot affect the new equip.
-The content digest covers simulation code, vehicle tuning and the WIT schema.
-The engine's APIs are experimental level 9, not an upstream compatibility claim.
+The content digest covers all simulation modules, vehicle tuning and the WIT schema.
+The engine's APIs are experimental level 10, not an upstream compatibility claim.
+
+The standalone simulation crate also contains tested attachment modifiers, ballistic
+penetration/ricochet rules, turret authorization/cadence, and fuel/repair transaction
+planning. These rule modules are foundations for later host integration; their
+presence does not enable those features in a running world. The catalog importer
+reads the wider original arsenal as metadata, while only AK-47 and Glock 17 are
+playable. See [CATALOG.md](tools/CATALOG.md).
 
 ## Verify
 
@@ -121,17 +141,16 @@ The bridge tests compile and execute the real client/server WASM components in
 Horizon's runtime. They exercise negotiation, content/version rejection, replay,
 reconnects, burst snapshots, timed reload reservation, shot edits and selected-slot
 vehicle deployment. Native engine tests cover inventory CAS, saved component
-round trips and vehicle profile validation. These do not replace live play tests:
-this workspace lacks the prepared Minecraft 26.3 resources required to launch a
-world, so rendering, movement feel and LAN gameplay remain unverified in game.
+round trips, vehicle profile validation, ground placement, steering/reverse,
+client correction, foreign texture atlases and bounded held poses. Isolated live
+Metal rendering checks exercised the 3D guns, aiming, reloading, automatic fire,
+pickup deployment, mounting and driving on the default server-thread path.
+Multiplayer/LAN feel and original animation parity remain to be checked.
 
-Code is GPL-3.0-only. The reused item/vehicle icon art remains under the original
+Code is GPL-3.0-only. The reused gun/vehicle model and texture art remains under the original
 SuperbWarfare asset license; it is packaged only with this mod, never in Horizon.
 
-Final validation: the full engine workspace passed 2,349 tests before the review
-fixes; the affected crates and rebuilt executable were checked again afterward.
-The mod workspace and ten real-WASM bridge tests pass, with bridge Clippy clean.
-The engine's full self-check still reports pre-existing Clippy warnings in
-untouched world/mob/dragon code; the changed crates also pass targeted Clippy with
-those existing warning categories allowed. Three parallel reviews covered gameplay,
-engine integration, and launch prerequisites. No live game was launched.
+Central validation covers the contract/simulation workspace, real-WASM bridge and
+converter tests, and native client library/binary tests. The engine-wide self-check
+still reports pre-existing Clippy warnings in unrelated code; targeted checks
+record those separately from changed-code findings.

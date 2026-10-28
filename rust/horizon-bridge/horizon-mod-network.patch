@@ -25,7 +25,7 @@ index 988ba826d..c53b99932 100644
              Output::SetBlocks {
                  dimension, blocks, ..
 diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
-index c97af3a47..53c1e46d4 100644
+index c97af3a47..06674a8fe 100644
 --- a/crates/horizon-client/src/game.rs
 +++ b/crates/horizon-client/src/game.rs
 @@ -111,7 +111,9 @@ mod mob_sounds;
@@ -38,7 +38,15 @@ index c97af3a47..53c1e46d4 100644
  #[cfg(feature = "mods")]
  mod mod_recipes;
  mod mod_render;
-@@ -9358,6 +9360,13 @@ impl Game<'_> {
+@@ -1718,6 +1720,7 @@ struct Game<'a> {
+     experience_display: (f32, bool, u64),
+     boats: Vec<boats::Boat>,
+     boat_models: boats::BoatModels,
++    vehicle_models: horizon_client::mod_vehicle_visual::VehicleModels,
+     /// EndCrystalModel's baked layer.
+     crystal_model: Option<horizon_client::mobs::Part>,
+     /// CushionModel's baked layer.
+@@ -9358,6 +9361,13 @@ impl Game<'_> {
          Ok(())
      }
      fn close_world(&mut self) -> Result<()> {
@@ -52,45 +60,96 @@ index c97af3a47..53c1e46d4 100644
          self.clear_waypoints();
          self.begin_closing_save(false)
      }
+@@ -10638,7 +10648,13 @@ impl Game<'_> {
+                 _ if spinning => ItemPose::SpinAttack,
+                 _ => ItemPose::Swing,
+             };
++            let cosmetic_pose = if hand == Hand::Main {
++                self.mod_held_pose(&stack.item, left)
++            } else {
++                glam::Mat4::IDENTITY
++            };
+             let m = to_world
++                * cosmetic_pose
+                 * horizon_client::first_person::item_pose(left, inverse_height, attack, pose);
+             // Seeded by the player id plus the context ordinal.
+             let (context, seed) = if left {
+@@ -13855,6 +13871,7 @@ impl<'a> Game<'a> {
+             experience_display: Default::default(),
+             boats: Vec::new(),
+             boat_models: prepared.boat_models,
++            vehicle_models: prepared.vehicle_models,
+             crystal_model: prepared.crystal_model,
+             cushion_model: prepared.cushion_model,
+             carts: Vec::new(),
+@@ -14005,6 +14022,7 @@ struct GameCpuResources {
+     armor_stand_assets: armor_stands::ArmorStandAssets,
+     waypoint_styles: horizon_client::locator_bar::WaypointStyles,
+     boat_models: boats::BoatModels,
++    vehicle_models: horizon_client::mod_vehicle_visual::VehicleModels,
+     cart_models: minecarts::CartModels,
+     crystal_model: Option<horizon_client::mobs::Part>,
+     cushion_model: Option<horizon_client::mobs::Part>,
+@@ -14026,6 +14044,7 @@ impl GameCpuResources {
+             armor_stand_assets: armor_stands::ArmorStandAssets::load(root, document.as_ref()),
+             waypoint_styles: horizon_client::locator_bar::WaypointStyles::load(root),
+             boat_models: boats::BoatModels::load(document.as_ref()),
++            vehicle_models: horizon_client::mod_vehicle_visual::VehicleModels::load(root),
+             cart_models: minecarts::CartModels::load(document.as_ref()),
+             crystal_model: model("minecraft:end_crystal#main"),
+             cushion_model: model("minecraft:cushion#main"),
 diff --git a/crates/horizon-client/src/game/boats.rs b/crates/horizon-client/src/game/boats.rs
-index 7e80f6f58..24a3e5f84 100644
+index 7e80f6f58..1724d538a 100644
 --- a/crates/horizon-client/src/game/boats.rs
 +++ b/crates/horizon-client/src/game/boats.rs
-@@ -27,6 +27,7 @@ pub(super) enum Status {
+@@ -27,6 +27,12 @@ pub(super) enum Status {
  #[derive(Clone, Debug)]
  pub(super) struct Boat {
      pub id: u32,
 +    pub mod_vehicle: Option<horizon_client::mod_vehicle::ModVehicle>,
++    /// Client prediction correction; never saved or authoritative on the server.
++    pub mod_correction: Option<horizon_client::mod_vehicle::VehicleCorrection>,
++    /// Signed local-forward distance, for cosmetic wheel rolling.
++    pub mod_travel: f64,
++    pub mod_travel_previous: f64,
      /// Wood type (`oak`, `bamboo` for the raft).
      pub wood: Arc<str>,
      pub position: Vec3,
-@@ -60,6 +61,7 @@ impl Boat {
+@@ -56,10 +62,19 @@ pub(super) struct Boat {
+ pub(super) const CHEST_SLOTS: usize = 27;
+ pub(super) const WIDTH: f64 = 1.375;
+ pub(super) const HEIGHT: f64 = 0.5625;
++/// Distance/radius is already radians; reduce by a full revolution for precision.
++fn wheel_roll(travel: f64, radius: f64) -> f32 {
++    (travel / radius).rem_euclid(std::f64::consts::TAU) as f32
++}
++
+ impl Boat {
      pub fn new(id: u32, wood: Arc<str>, position: Vec3, yaw: f32) -> Self {
          Self {
              id,
 +            mod_vehicle: None,
++            mod_correction: None,
++            mod_travel: 0.,
++            mod_travel_previous: 0.,
              wood,
              position,
              previous: position,
-@@ -90,6 +92,17 @@ impl Boat {
+@@ -90,6 +105,13 @@ impl Boat {
          self
      }
      pub fn bounds(&self) -> Aabb {
 +        if let Some(v) = &self.mod_vehicle {
-+            let q = &v.profile;
-+            let (sin, cos) = f64::from(self.yaw).to_radians().sin_cos();
-+            let w = (q.width * cos.abs() + q.length * sin.abs()) / 2.;
-+            let l = (q.length * cos.abs() + q.width * sin.abs()) / 2.;
-+            let p = self.position;
-+            return Aabb::new(
-+                Vec3::new(p.x - w, p.y, p.z - l),
-+                Vec3::new(p.x + w, p.y + q.height, p.z + l),
++            return horizon_client::mod_vehicle::chassis_bounds(
++                &v.profile,
++                self.position,
++                self.yaw,
 +            );
 +        }
          let (w, p) = (WIDTH / 2.0, self.position);
          Aabb::new(
              Vec3::new(p.x - w, p.y, p.z - w),
-@@ -103,10 +116,17 @@ impl Boat {
+@@ -103,10 +125,17 @@ impl Boat {
      }
      /// `getMaxPassengers`: two, one beside a chest.
      pub fn max_passengers(&self) -> usize {
@@ -109,7 +168,7 @@ index 7e80f6f58..24a3e5f84 100644
          let height = HEIGHT as f32;
          f64::from(if &*self.wood == "bamboo" {
              height * 0.888_888_9
-@@ -125,7 +145,12 @@ impl Boat {
+@@ -125,7 +154,12 @@ impl Boat {
          rider_offset: f64,
          previous: bool,
      ) -> Vec3 {
@@ -123,7 +182,7 @@ index 7e80f6f58..24a3e5f84 100644
          if count > 1 {
              z = if index == 0 { 0.2 } else { -0.6 };
              if animal {
-@@ -346,7 +371,151 @@ impl Game<'_> {
+@@ -346,7 +380,219 @@ impl Game<'_> {
          }
      }
      /// `AbstractBoat.tick` for one boat (`controlled` when the player rides it).
@@ -131,22 +190,21 @@ index 7e80f6f58..24a3e5f84 100644
 +        let profile = b.mod_vehicle.as_ref().unwrap().profile.clone();
 +        b.previous = b.position;
 +        b.previous_yaw = b.yaw;
++        b.mod_travel_previous = b.mod_travel;
 +        b.hurt_time = (b.hurt_time - 1).max(0);
 +        b.damage = (b.damage - 1.).max(0.);
 +        if !controlled {
 +            b.input = [false; 4];
 +        }
-+        let [left, right, forward, back] = b.input;
-+        let speed = (b.velocity.x * b.velocity.x + b.velocity.z * b.velocity.z).sqrt();
-+        b.delta_rotation = if controlled && speed > 0.005 {
-+            (i32::from(right) - i32::from(left)) as f32
-+                * profile.turn_speed
-+                * (speed / profile.max_speed).min(1.) as f32
-+        } else {
-+            0.
-+        };
 +        let old_yaw = b.yaw;
-+        b.yaw += b.delta_rotation;
++        let mut driven = horizon_client::mod_vehicle::ground_drive(
++            &profile,
++            b.velocity,
++            b.yaw,
++            b.input,
++            b.on_ground,
++        );
++        b.yaw = driven.yaw;
 +        let obstacles = self.boat_move_obstacles(&b);
 +        let mut blocks = SceneCollisions {
 +            world: &self.world,
@@ -158,19 +216,16 @@ index 7e80f6f58..24a3e5f84 100644
 +            .unwrap_or(false)
 +        {
 +            b.yaw = old_yaw;
-+            b.delta_rotation = 0.;
++            driven = horizon_client::mod_vehicle::ground_drive(
++                &profile,
++                b.velocity,
++                old_yaw,
++                [false, false, b.input[2], b.input[3]],
++                b.on_ground,
++            );
 +        }
-+        let thrust = f64::from(i32::from(forward) - i32::from(back)) * profile.acceleration;
-+        let (sin, cos) = f64::from(b.yaw).to_radians().sin_cos();
-+        b.velocity.x = (b.velocity.x * profile.drag - sin * thrust)
-+            .clamp(-profile.max_speed, profile.max_speed);
-+        b.velocity.z = (b.velocity.z * profile.drag + cos * thrust)
-+            .clamp(-profile.max_speed, profile.max_speed);
-+        let horizontal = (b.velocity.x * b.velocity.x + b.velocity.z * b.velocity.z).sqrt();
-+        if horizontal > profile.max_speed {
-+            b.velocity.x *= profile.max_speed / horizontal;
-+            b.velocity.z *= profile.max_speed / horizontal;
-+        }
++        b.delta_rotation = driven.turn;
++        b.velocity = driven.velocity;
 +        b.velocity.y = (b.velocity.y - 0.08).max(-3.);
 +        // Do not drive into unloaded chunks.
 +        let next = b.position.add_vector(b.velocity);
@@ -200,7 +255,15 @@ index 7e80f6f58..24a3e5f84 100644
 +                b.velocity.z = 0.;
 +            }
 +        }
++        let displacement = b.position.subtract(b.previous);
++        let (sin, cos) = f64::from(b.yaw).to_radians().sin_cos();
++        b.mod_travel += -sin * displacement.x + cos * displacement.z;
 +        b
++    }
++    /// Whether a loaded model actually draws: a tree with no polygon on any
++    /// part would leave the vehicle invisible, so the fallback box runs.
++    fn model_has_geometry(part: &Part) -> bool {
++        !part.polygons.is_empty() || part.children.iter().any(Self::model_has_geometry)
 +    }
 +    fn mod_vehicle_geometry(
 +        &self,
@@ -212,6 +275,70 @@ index 7e80f6f58..24a3e5f84 100644
 +        let Some(v) = &b.mod_vehicle else {
 +            return;
 +        };
++        if let Some(model) = self.vehicle_models.get(&v.profile.definition)
++            && Self::model_has_geometry(&model.part)
++            && let Some(texture) = self.gui.atlas.sprites.get(&model.texture)
++        {
++            let p = at(b.previous).lerp(at(b.position), alpha) - camera;
++            if p.length_squared() > 256. * 256. {
++                return;
++            }
++            let yaw = (b.previous_yaw + (b.yaw - b.previous_yaw) * alpha as f32).to_radians();
++            let base = glam::Mat4::from_translation(p.as_vec3())
++                * glam::Mat4::from_rotation_y(-yaw)
++                * glam::Mat4::from_scale(glam::Vec3::splat(v.profile.length as f32 / model.length));
++            let light = self.world.light(
++                b.position.x.floor() as i32,
++                (b.position.y + 1.).floor() as i32,
++                b.position.z.floor() as i32,
++            );
++            let mut poses = horizon_client::mobs::anim::Poses::new(&model.part);
++            let travel = b.mod_travel_previous + (b.mod_travel - b.mod_travel_previous) * alpha;
++            // `Poses` slots 3/4/5 are ZYX Euler angles in radians applied *after*
++            // the child rotation below (render.rs rotates Z, then Y, then X), so
++            // the wheel's X spin and the steer part's Y yaw are not commuted with
++            // anything else on the bone. Both are additive on the bone's authored
++            // pose, so a nonzero authored rotation just offsets the animation.
++            //
++            // Sign of the roll: `mod_travel` (boats.rs tick) grows along the
++            // vehicle's own nose direction, and a forward roll about +X carries
++            // +Z to -Y (perpendicular to the nose, toward the wheels' contact
++            // side as authored for a hull whose local nose looks down +Z). The
++            // angle is signed, not wrapped to a half-turn: a wheel rolling
++            // backwards must spin backwards.
++            let wheel_angle = wheel_roll(travel, f64::from(model.wheel_radius));
++            for part in &model.wheel_parts {
++                if poses.has(part) {
++                    poses.get(part)[3] += wheel_angle;
++                }
++            }
++            // Steering: `ground_drive` defines `turn = steer * sign(longitudinal)
++            // * speed`, with `steer = right - left`, and applies `yaw += turn`.
++            // The hull rotation below is `from_rotation_y(-yaw)`, so a *positive*
++            // ground turn veers the rendered nose toward screen-left; to point the
++            // wheels the same way their bone yaw (slot 4, about +Y) must decrease
++            // as `turn` increases. The rendered yaw is interpolated, so the sign
++            // is a pure direction test: steer input right -> rendered wheel yaw
++            // decreases. Steering only rotates the wheel, never a sign-flip of
++            // the roll above.
++            let steer = (i32::from(b.input[1]) - i32::from(b.input[0])) as f32 * -0.45;
++            for part in &model.steer_parts {
++                if poses.has(part) {
++                    poses.get(part)[4] += steer;
++                }
++            }
++            horizon_client::mobs::render::draw(
++                &model.part,
++                base,
++                &poses,
++                [texture.u0, texture.v0, texture.u1, texture.v1],
++                0xffffffff,
++                (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8),
++                0,
++                out,
++            );
++            return;
++        }
 +        let Some(white) = self.gui.atlas.sprites.get("horizon/white") else {
 +            return;
 +        };
@@ -254,7 +381,7 @@ index 7e80f6f58..24a3e5f84 100644
 +                    (f32::from(bl) * shade) as u8,
 +                    a,
 +                ]);
-+                for j in [0, 1, 2, 0, 2, 3] {
++                for j in 0..4 {
 +                    out.push(Vertex {
 +                        pos: points[corners[j]].to_array(),
 +                        uv,
@@ -275,7 +402,7 @@ index 7e80f6f58..24a3e5f84 100644
          b.previous = b.position;
          b.previous_yaw = b.yaw;
          b.old_status = b.status;
-@@ -831,7 +1000,12 @@ impl Game<'_> {
+@@ -831,7 +1077,12 @@ impl Game<'_> {
          b.hurt_dir = -b.hurt_dir;
          b.hurt_time = 10;
          b.damage += damage * 10.0;
@@ -289,7 +416,7 @@ index 7e80f6f58..24a3e5f84 100644
          if destroyed {
              self.eject_boat_mobs(i, true);
              let b = self.boats.remove(i);
-@@ -841,7 +1015,10 @@ impl Game<'_> {
+@@ -841,7 +1092,10 @@ impl Game<'_> {
                  for stack in b.items.iter().flatten() {
                      self.spawn_item(stack.clone(), at, super::dispenser::new_item_motion(), 10);
                  }
@@ -301,7 +428,7 @@ index 7e80f6f58..24a3e5f84 100644
                  self.spawn_item(
                      ItemStack {
                          item: Arc::from(item.as_str()),
-@@ -866,6 +1043,10 @@ impl Game<'_> {
+@@ -866,6 +1120,10 @@ impl Game<'_> {
          );
          for b in &self.boats {
              let entity_start = out.len();
@@ -312,6 +439,100 @@ index 7e80f6f58..24a3e5f84 100644
              // EntityRenderer.shouldRender.
              let (previous, position) = (at(b.previous), at(b.position));
              if !self.standing_entity_in_view(
+@@ -961,3 +1219,93 @@ impl Game<'_> {
+         }
+     }
+ }
++#[cfg(test)]
++mod mod_vehicle_visual_tests {
++    use super::*;
++
++    fn part(name: &str, polygons: usize, children: Vec<Part>) -> Part {
++        Part {
++            name: name.into(),
++            pose: [0.0; 9],
++            polygons: vec![
++                horizon_client::mobs::Polygon {
++                    normal: [0.0, 0.0, 1.0],
++                    vertices: [[0.0; 5]; 4],
++                };
++                polygons
++            ],
++            children,
++        }
++    }
++
++    /// A model that draws nothing must not take the textured path: the
++    /// fallback box is what keeps the vehicle visible.
++    #[test]
++    fn empty_geometry_falls_through_to_the_fallback() {
++        assert!(!Game::model_has_geometry(&part("vehicle", 0, vec![])));
++        assert!(!Game::model_has_geometry(&part(
++            "vehicle",
++            0,
++            vec![part("wheel", 0, vec![part("rim", 0, vec![])])]
++        )));
++    }
++
++    #[test]
++    fn geometry_on_any_part_counts() {
++        assert!(Game::model_has_geometry(&part("vehicle", 1, vec![])));
++        assert!(Game::model_has_geometry(&part(
++            "vehicle",
++            0,
++            vec![part("wheel", 1, vec![])]
++        )));
++    }
++
++    /// `Poses::has` is the check the renderer uses to skip unknown part
++    /// names; the loader already guarantees they exist, this pins the
++    /// contract that a wheel/steer name must be a real bone.
++    #[test]
++    fn wheel_and_steer_names_resolve_to_bones() {
++        let root = part("vehicle", 0, vec![part("wheel_front", 1, vec![])]);
++        let poses = horizon_client::mobs::anim::Poses::new(&root);
++        assert!(poses.has("wheel_front"));
++        assert!(poses.has("vehicle"));
++        assert!(!poses.has("wheel_rear"));
++    }
++
++    /// The pose slot order the wheel/steer animation targets: 3 is the X roll
++    /// (wheels), 4 the Y yaw (steering), 5 the Z roll. Slot 3 is the bone Y
++    /// Euler angle applied *last* under `EulerRot::ZYX`, matching how the wheel
++    /// spins about its own axle; slot 4 is a pure yaw. This pins the indices so
++    /// a slot renumbering elsewhere cannot silently retarget the animation.
++    #[test]
++    fn pose_slots_match_the_animation_targets() {
++        let root = part("vehicle", 1, vec![part("wheel_front", 1, vec![])]);
++        let mut poses = horizon_client::mobs::anim::Poses::new(&root);
++        poses.get("wheel_front")[3] = 1.5;
++        poses.get("wheel_front")[4] = -0.45;
++        assert_eq!(poses.pose(&part("wheel_front", 1, vec![]))[3], 1.5);
++        assert_eq!(poses.pose(&part("wheel_front", 1, vec![]))[4], -0.45);
++        // A name that is not in the tree edits only the dummy pose: the tree
++        // pose is untouched, so a stale reference animates nothing.
++        poses.get("wheel_rear")[3] = 1.0;
++        assert_ne!(poses.pose(&part("wheel_front", 1, vec![]))[3], 1.0);
++    }
++
++    /// `mod_travel` grows along the nose; the renderer maps it to a signed,
++    /// non-wrapped roll where a positive distance and a full turn agree. A
++    /// reversed travel must give the opposite rotation, not the same wrapped
++    /// value: braking in reverse has to spin the wheels backwards.
++    #[test]
++    fn wheel_roll_tracks_signed_travel() {
++        let radius = 0.35f64;
++        let angle = |travel| wheel_roll(travel, radius);
++        assert!((angle(radius * std::f64::consts::TAU) - angle(0.0)).abs() < 1e-4);
++        // The top of a wheel turns in opposite directions for a quarter-turn
++        // forward and back; half-turns instead have the same orientation.
++        let quarter = radius * std::f64::consts::FRAC_PI_2;
++        assert!((angle(quarter).sin() - 1.).abs() < 1e-5);
++        assert!((angle(-quarter).sin() + 1.).abs() < 1e-5);
++        assert!((angle(2. * quarter).cos() + 1.).abs() < 1e-5);
++        assert!((angle(-2. * quarter).cos() + 1.).abs() < 1e-5);
++    }
++}
 diff --git a/crates/horizon-client/src/game/creatures.rs b/crates/horizon-client/src/game/creatures.rs
 index f7d4828f1..ae0212074 100644
 --- a/crates/horizon-client/src/game/creatures.rs
@@ -382,9 +603,18 @@ index abe655c65..e8a523a8b 100644
              S::ChangeDifficulty(p) if host.hub.guests[gi].permission >= 2 => {
                  if !self.level.difficulty_locked && (0..=3).contains(&p.difficulty) {
 diff --git a/crates/horizon-client/src/game/lan_vehicles.rs b/crates/horizon-client/src/game/lan_vehicles.rs
-index 00795aa62..0bb3665aa 100644
+index 00795aa62..5b0e4bcc7 100644
 --- a/crates/horizon-client/src/game/lan_vehicles.rs
 +++ b/crates/horizon-client/src/game/lan_vehicles.rs
+@@ -113,7 +113,7 @@ impl Game<'_> {
+             (g.vehicle, g.vehicle_good) = (None, None);
+             return;
+         }
+-        if let Some(i) = boat {
++        if let Some(i) = boat.filter(|i| self.boats[*i].mod_vehicle.is_none()) {
+             // AbstractBoat.tick on the server for a boat its rider drives:
+             // only the hurt animation and the damage wear off here.
+             let b = &mut self.boats[i];
 @@ -139,6 +139,11 @@ impl Game<'_> {
                      game.dismount(i);
                      return None;
@@ -451,10 +681,10 @@ index ab316c4c6..0804de5bb 100644
  impl Game<'_> {
 diff --git a/crates/horizon-client/src/game/mod_gameplay.rs b/crates/horizon-client/src/game/mod_gameplay.rs
 new file mode 100644
-index 000000000..5a9956812
+index 000000000..4122e86eb
 --- /dev/null
 +++ b/crates/horizon-client/src/game/mod_gameplay.rs
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,363 @@
 +//! Generic mod gameplay adapter. All mutations execute on the authoritative
 +//! game thread, against the selected stack, with no client supplied aim/pose.
 +#[cfg(feature = "mods")]
@@ -466,6 +696,46 @@ index 000000000..5a9956812
 +};
 +#[cfg(feature = "mods")]
 +use horizon_core::geometry::Vec3;
++#[cfg(feature = "mods")]
++struct VehicleGround<'w, 'r> {
++    scene: horizon_client::collisions::SceneCollisions<'w, 'r>,
++}
++#[cfg(feature = "mods")]
++impl mod_vehicle::GroundPlacementWorld for VehicleGround<'_, '_> {
++    fn support_height(&mut self, x: f64, z: f64, ceiling: f64, floor: f64) -> Option<f64> {
++        use horizon_core::geometry::Aabb;
++        if !self.scene.world.loaded(x.floor() as i32, z.floor() as i32) {
++            return None;
++        }
++        let probe = Aabb::new(
++            Vec3::new(x - 0.04, ceiling, z - 0.04),
++            Vec3::new(x + 0.04, ceiling + 0.08, z + 0.04),
++        );
++        if !self.scene.unobstructed(probe).ok()? {
++            return None;
++        }
++        let wanted = floor - ceiling;
++        let moved = self
++            .scene
++            .resolve(probe, Vec3::new(0., wanted, 0.), 0., false)
++            .ok()?;
++        (moved.y > wanted + 1e-6).then_some(ceiling + moved.y)
++    }
++    fn unobstructed(&mut self, bounds: horizon_core::geometry::Aabb) -> bool {
++        let min = bounds.min_position();
++        let max = bounds.max_position();
++        for x in (min.x.floor() as i32 >> 4)..=((max.x - 1e-5).floor() as i32 >> 4) {
++            for z in (min.z.floor() as i32 >> 4)..=((max.z - 1e-5).floor() as i32 >> 4) {
++                if !self.scene.world.chunks.contains_key(&(x, z)) {
++                    return false;
++                }
++            }
++        }
++        self.scene
++            .unobstructed(bounds.deflate(Vec3::new(1e-5, 1e-5, 1e-5)))
++            .unwrap_or(false)
++    }
++}
 +#[cfg(feature = "mods")]
 +impl Game<'_> {
 +    pub(super) fn mod_inventories(&self) -> Vec<(String, horizon_mods::PlayerInventory)> {
@@ -635,32 +905,43 @@ index 000000000..5a9956812
 +        let spawn = if let Some(json) = &edit.vehicle {
 +            let Some(profile) = VehicleProfile::parse(json, owner).filter(|p| p.item == edit.item)
 +            else {
++                log::debug!("mod vehicle placement: invalid profile for {}", edit.item);
 +                return;
 +            };
-+            // The native placement ray stops at blocks. A failed placement
-+            // leaves both the item and all its data untouched.
-+            let Some(hit) = self.pick() else {
++            // Ground deployment clips actual collision surfaces: grass and
++            // other empty outlines cannot move the chassis into mid-air.
++            let mut ground = VehicleGround {
++                scene: horizon_client::collisions::SceneCollisions {
++                    world: &self.world,
++                    binding: self.collision,
++                    subject: None,
++                },
++            };
++            let Some(hit) = self.vehicle_ground_hit(&mut ground.scene) else {
++                log::debug!("mod vehicle placement: no upward ground hit");
 +                return;
 +            };
-+            let at = Vec3::new(hit.point[0], hit.point[1] + 0.02, hit.point[2]);
++            // The clicked surface anchors the back of the chassis, so a long
++            // vehicle does not spawn around the player standing behind it.
++            let (sin, cos) = f64::from(self.yaw).to_radians().sin_cos();
++            let offset = profile.length * 0.5 + 0.4;
++            let center = hit.add_vector(Vec3::new(-sin * offset, 0., cos * offset));
++            let Some(at) =
++                mod_vehicle::ground_placement(&profile, center, [0, 1, 0], self.yaw, &mut ground)
++            else {
++                log::debug!(
++                    "mod vehicle placement: unsupported or obstructed footprint at {center:?}"
++                );
++                return;
++            };
 +            let mut b = Boat::new(self.next_entity + 1, "oak".into(), at, self.yaw);
 +            b.mod_vehicle = Some(ModVehicle {
 +                owner: owner.into(),
 +                health: profile.max_health,
 +                profile,
 +            });
-+            let mut scene = horizon_client::collisions::SceneCollisions {
-+                world: &self.world,
-+                binding: self.collision,
-+                subject: None,
-+            };
 +            if self.boat_entity_collision(b.bounds()) {
-+                return;
-+            }
-+            if !scene
-+                .unobstructed(b.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5)))
-+                .unwrap_or(false)
-+            {
++                log::debug!("mod vehicle placement: entity obstructs the footprint");
 +                return;
 +            }
 +            Some(b)
@@ -720,6 +1001,34 @@ index 000000000..5a9956812
 +            );
 +        }
 +    }
++    /// Server-owned eye/yaw, with collision shapes and an upward surface.
++    /// Deliberately bypasses forced_hit from unrelated vanilla use packets.
++    fn vehicle_ground_hit(
++        &self,
++        scene: &mut horizon_client::collisions::SceneCollisions<'_, '_>,
++    ) -> Option<Vec3> {
++        use horizon_core::geometry::{Direction, traverse_blocks};
++        use horizon_world::collision_context::CollisionContext;
++        let eye = self.eye_position()?;
++        let start = Vec3::new(eye[0], eye[1], eye[2]);
++        let dir = super::view_vector(self.yaw, self.pitch);
++        let end = start.add_vector(Vec3::new(dir[0], dir[1], dir[2]).scale(self.reach()));
++        let context = CollisionContext::position(start.y);
++        let binding = self.collision;
++        let hit = traverse_blocks(start, end, 128, |p| {
++            if !scene.world.loaded(p.x, p.z) {
++                return Some(Err(()));
++            }
++            let state = scene.world.block(p.x, p.y, p.z);
++            match binding.collision_shape_with_context(scene, state, p, &context) {
++                Ok(shape) => shape.clip(start, end, p).map(Ok),
++                Err(_) => Some(Err(())),
++            }
++        })
++        .ok()??
++        .ok()?;
++        (hit.direction == Direction::Up && !hit.inside).then_some(hit.location)
++    }
 +    pub(super) fn apply_vehicle_models(&mut self, owner: &str, models: Vec<(u32, String)>) {
 +        if self.remote.is_none() {
 +            return;
@@ -740,7 +1049,7 @@ index 000000000..5a9956812
 +    }
 +}
 diff --git a/crates/horizon-client/src/game/mod_input.rs b/crates/horizon-client/src/game/mod_input.rs
-index 3769b03c9..e337560b3 100644
+index 3769b03c9..26badc155 100644
 --- a/crates/horizon-client/src/game/mod_input.rs
 +++ b/crates/horizon-client/src/game/mod_input.rs
 @@ -75,6 +75,24 @@ impl Game<'_> {
@@ -808,6 +1117,33 @@ index 3769b03c9..e337560b3 100644
          let Some(u) = &self.mods.using else {
              return;
          };
+@@ -209,3 +259,26 @@ impl Game<'_> {
+         })
+     }
+ }
++
++impl Game<'_> {
++    pub(super) fn mod_held_pose(&self, item: &str, left: bool) -> glam::Mat4 {
++        #[cfg(feature = "mods")]
++        if self.mod_playing()
++            && let Some(p) = self.mods.mods.held_pose(item)
++        {
++            return glam::Mat4::from_translation(glam::Vec3::new(
++                if left { -p.x } else { p.x },
++                p.y,
++                p.z,
++            )) * glam::Mat4::from_euler(
++                glam::EulerRot::YXZ,
++                (if left { -p.yaw } else { p.yaw }).to_radians(),
++                p.pitch.to_radians(),
++                (if left { -p.roll } else { p.roll }).to_radians(),
++            );
++        }
++        #[cfg(not(feature = "mods"))]
++        let _ = (item, left);
++        glam::Mat4::IDENTITY
++    }
++}
 diff --git a/crates/horizon-client/src/game/mod_network.rs b/crates/horizon-client/src/game/mod_network.rs
 new file mode 100644
 index 000000000..d54db49f5
@@ -923,7 +1259,7 @@ index 000000000..d54db49f5
 +    )
 +}
 diff --git a/crates/horizon-client/src/game/mods.rs b/crates/horizon-client/src/game/mods.rs
-index 52dc46fe0..7af1532fa 100644
+index 52dc46fe0..c1700572d 100644
 --- a/crates/horizon-client/src/game/mods.rs
 +++ b/crates/horizon-client/src/game/mods.rs
 @@ -43,6 +43,8 @@ pub(super) struct ModsState {
@@ -935,7 +1271,98 @@ index 52dc46fe0..7af1532fa 100644
      /// Capability `render`'s camera shakes.
      #[cfg(feature = "mods")]
      pub(super) shake: super::mod_render::Shake,
-@@ -464,7 +466,17 @@ impl Game<'_> {
+@@ -199,12 +201,43 @@ pub(super) fn content_root(
+     enabled: &std::collections::BTreeSet<String>,
+     dev: &[std::path::PathBuf],
+ ) -> std::path::PathBuf {
+-    use horizon_client::mod_content::{self, ContentMod};
+-    use horizon_mods::{Capability, Content, Package};
+-    let here = std::env::current_dir().unwrap_or_default();
+-    let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
++    let here = Game::options_path()
++        .parent()
++        .map(std::path::Path::to_path_buf)
++        .unwrap_or_default();
++    content_root_in(root, &here, enabled, dev)
++}
++
++/// The mods to consider for content: the `.hmod` files in the mods folder,
++/// then the dev mods (which replace the file with the same path). This is the
++/// one place the installed set is resolved, so content loading and the runtime
++/// can never disagree about it.
++fn installed_paths(
++    mods_dir: &std::path::Path,
++    dev: &[std::path::PathBuf],
++) -> Vec<std::path::PathBuf> {
++    let mut paths = horizon_mods::find(mods_dir);
+     paths.retain(|p| !dev.contains(p));
+     paths.extend(dev.iter().cloned());
++    paths
++}
++
++/// [`content_root`], reading the installed mods from `game_dir`'s
++/// `horizon-mods/` (`mod_list::dir`) so the source of the mods is explicit.
++/// Content loading and the runtime ([`Game::start_mods`]) both resolve the
++/// folder from the game directory, never the process's current directory, so
++/// the tables layered at start and the mods that run later can never disagree
++/// about which mods were installed or enabled.
++pub(super) fn content_root_in(
++    root: &std::path::Path,
++    game_dir: &std::path::Path,
++    enabled: &std::collections::BTreeSet<String>,
++    dev: &[std::path::PathBuf],
++) -> std::path::PathBuf {
++    use horizon_client::mod_content::{self, ContentMod};
++    use horizon_mods::{Capability, Content, Package};
++    let here = game_dir.to_path_buf();
++    let paths = installed_paths(&mod_list::dir(&here), dev);
+     let mut mods: Vec<ContentMod> = Vec::new();
+     for path in &paths {
+         let Ok(package) = Package::read(path) else {
+@@ -255,12 +288,26 @@ pub(super) fn content_root(
+     }
+ }
+ 
++/// The folder the installed mods live in: `horizon-mods/` in the game
++/// directory (beside `options.txt`). Content loading (`content_root`) and the
++/// runtime ([`Game::start_mods`]) both resolve it here, so the tables layered
++/// at start and the mods that run later can never disagree about where the
++/// mods are. A build without the `mods` feature resolves it too, to report
++/// the mods that stay off.
++impl Game<'_> {
++    pub(super) fn mods_dir() -> std::path::PathBuf {
++        Game::options_path()
++            .parent()
++            .map_or_else(|| std::path::PathBuf::from(mod_list::DIR), mod_list::dir)
++    }
++}
++
+ /// A build without the `mods` feature: no mod runs.
+ #[cfg(not(feature = "mods"))]
+ impl Game<'_> {
+     /// Says why the installed and dev mods don't run.
+     pub(super) fn start_mods(&mut self) {
+-        let dir = Self::options_path().with_file_name(mod_list::DIR);
++        let dir = Self::mods_dir();
+         let found = horizon_mods::find(&dir).len() + self.mods.dev.len();
+         if found > 0 {
+             log::warn!(
+@@ -291,11 +338,10 @@ impl Game<'_> {
+ impl Game<'_> {
+     /// Reads `horizon-mods/` and the dev mods, and starts the ones turned on.
+     pub(super) fn start_mods(&mut self) {
+-        let dir = Self::options_path().with_file_name(mod_list::DIR);
+         let dev = &self.mods.dev;
+-        let mut paths = horizon_mods::find(&dir);
+-        paths.retain(|p| !dev.contains(p));
+-        paths.extend(dev.iter().cloned());
++        // The same folder `content_root` layers at start: `horizon-mods/`
++        // beside `options.txt`, then the dev mods.
++        let paths = installed_paths(&Self::mods_dir(), dev);
+         // A dev mod is on whatever the list says.
+         let dev_ids: Vec<String> = dev
+             .iter()
+@@ -464,7 +510,17 @@ impl Game<'_> {
                  .collect();
          }
          let (recipes, known_recipes) = self.mod_recipes();
@@ -953,7 +1380,7 @@ index 52dc46fe0..7af1532fa 100644
              player,
              clock,
              gui_size: self.gui_size(),
-@@ -666,6 +678,23 @@ impl Game<'_> {
+@@ -666,6 +722,23 @@ impl Game<'_> {
      pub(super) fn route_mod_output(&mut self, mut host: Option<&mut LanHost>) {
          for output in self.mods.mods.drain() {
              let line = match output {
@@ -977,6 +1404,58 @@ index 52dc46fe0..7af1532fa 100644
                  Output::Chat { name, text } => {
                      let mut line = Text::literal(format!("[{name}] ")).with_color(text::GRAY);
                      line.push(Text::literal(text));
+@@ -1235,3 +1308,51 @@ const MOD_UI_COLUMN: f32 = 200.0;
+ /// A key row's height with its gap, as the widgets below it space out.
+ #[cfg(feature = "mods")]
+ const MOD_UI_KEY_ROW: f32 = 26.0;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The content-root boundary: content loading discovers the `.hmod` files
++    /// in the *given* game directory, so the tables it layers are the ones the
++    /// list (`horizon-mods.txt` beside `options.txt`) enabled, whatever the
++    /// process's current directory happens to be.
++    #[test]
++    fn content_discovery_follows_the_game_directory() {
++        let dir = std::env::temp_dir().join(format!("horizon-mods-dir-{}", std::process::id()));
++        let installed = mod_list::dir(&dir);
++        std::fs::create_dir_all(&installed).unwrap();
++        std::fs::write(installed.join("content.hmod"), b"not a real package").unwrap();
++        std::fs::write(installed.join("notes.txt"), b"ignored").unwrap();
++        // A mod folder is one that holds a manifest (`horizon-mod.toml`).
++        std::fs::create_dir_all(installed.join("folder-mod")).unwrap();
++        std::fs::write(installed.join("folder-mod/horizon-mod.toml"), b"id=\"x\"").unwrap();
++
++        let found = installed_paths(&installed, &[]);
++        assert!(found.iter().any(|p| p.ends_with("content.hmod")));
++        assert!(found.iter().any(|p| p.ends_with("folder-mod")));
++        assert!(!found.iter().any(|p| p.ends_with("notes.txt")));
++        // A dev mod replaces the installed file with the same path.
++        let dev = vec![installed.join("content.hmod")];
++        let with_dev = installed_paths(&installed, &dev);
++        assert_eq!(
++            with_dev
++                .iter()
++                .filter(|p| p.ends_with("content.hmod"))
++                .count(),
++            1
++        );
++        // A missing mods folder yields nothing (the vanilla root).
++        assert!(installed_paths(std::path::Path::new("/nonexistent/horizon-mods"), &[]).is_empty());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// The runtime and content loading resolve the same folder: `mods_dir()`
++    /// is `horizon-mods/` beside `options.txt`, never the process's cwd on its
++    /// own.
++    #[test]
++    fn mods_dir_is_beside_options_txt() {
++        let expected = Game::options_path().parent().unwrap().join(mod_list::DIR);
++        assert_eq!(Game::mods_dir(), expected);
++    }
++}
 diff --git a/crates/horizon-client/src/game/persist.rs b/crates/horizon-client/src/game/persist.rs
 index 8ceea7e12..c08ed08b4 100644
 --- a/crates/horizon-client/src/game/persist.rs
@@ -1098,45 +1577,44 @@ index 22b7c13df..eb72167a4 100644
              return false;
          }
 diff --git a/crates/horizon-client/src/game/remote_objects.rs b/crates/horizon-client/src/game/remote_objects.rs
-index d70ab795d..f98d601ff 100644
+index d70ab795d..a1c20782a 100644
 --- a/crates/horizon-client/src/game/remote_objects.rs
 +++ b/crates/horizon-client/src/game/remote_objects.rs
-@@ -232,7 +232,7 @@ impl Game<'_> {
-         // The boat the player drives turns here (isLocalInstanceAuthoritative).
-         let driven = self.riding;
-         if let Some(b) = self.boats.iter_mut().find(|b| b.id == id) {
--            if Some(id) == driven {
-+            if Some(id) == driven && b.mod_vehicle.is_none() {
-                 return;
-             }
-             if let Some(yaw) = yaw {
-@@ -262,7 +262,7 @@ impl Game<'_> {
-         // The boat the player drives moves here, not where the server says.
-         let driven = self.riding;
-         for b in &mut self.boats {
--            if Some(b.id) == driven {
-+            if Some(b.id) == driven && b.mod_vehicle.is_none() {
-                 continue;
+@@ -267,7 +267,13 @@ impl Game<'_> {
              }
              b.previous = b.position;
+             b.previous_yaw = b.yaw;
++            b.mod_travel_previous = b.mod_travel;
+             b.position = step(b.id, b.position);
++            if b.mod_vehicle.is_some() {
++                let displacement = b.position.subtract(b.previous);
++                let (sin, cos) = f64::from(b.yaw).to_radians().sin_cos();
++                b.mod_travel += -sin * displacement.x + cos * displacement.z;
++            }
+         }
+         for a in &mut self.armor_stands {
+             a.position = step(a.id, a.position);
 diff --git a/crates/horizon-client/src/game/remote_vehicles.rs b/crates/horizon-client/src/game/remote_vehicles.rs
-index c9cbf1159..191f2523a 100644
+index c9cbf1159..3f9eae0e2 100644
 --- a/crates/horizon-client/src/game/remote_vehicles.rs
 +++ b/crates/horizon-client/src/game/remote_vehicles.rs
-@@ -163,7 +163,11 @@ impl Game<'_> {
+@@ -163,7 +163,14 @@ impl Game<'_> {
              // AbstractBoat.tick on the controlling client: steer and move.
              let mut b = self.boats[i].clone();
              b.input = [keys.left, keys.right, keys.forward, keys.backward];
 -            let b = self.tick_boat(b, true);
-+            let b = if b.mod_vehicle.is_some() {
-+                b
-+            } else {
-+                self.tick_boat(b, true)
-+            };
++            let was_yaw = b.yaw;
++            let mut b = self.tick_boat(b, true);
++            if b.mod_vehicle.is_some()
++                && let Some(correction) = b.mod_correction.as_mut()
++            {
++                correction.correct(&mut b.position, &mut b.yaw, &mut b.velocity, self.ticks);
++                b.delta_rotation = (b.yaw - was_yaw + 180.).rem_euclid(360.) - 180.;
++            }
              // positionRider: the seat turns with the boat; clampRotation.
              self.yaw += b.delta_rotation;
              let delta = (self.yaw - b.yaw + 180.0).rem_euclid(360.0) - 180.0;
-@@ -198,6 +202,9 @@ impl Game<'_> {
+@@ -198,6 +205,9 @@ impl Game<'_> {
          else {
              return Vec::new();
          };
@@ -1146,6 +1624,324 @@ index c9cbf1159..191f2523a 100644
          vec![
              S::MoveVehicle(play::MoveVehicleRequest {
                  position: [b.position.x, b.position.y, b.position.z],
+@@ -215,6 +225,10 @@ impl Game<'_> {
+     /// `ClientPacketListener.handleMoveVehicle`: the server put the boat the
+     /// player drives back.
+     pub(super) fn remote_move_vehicle(&mut self, position: [f64; 3], yaw: f32) {
++        if !position.iter().all(|v| v.is_finite()) || !yaw.is_finite() {
++            return;
++        }
++        let tick = self.ticks;
+         let Some(b) = self
+             .riding
+             .and_then(|id| self.boats.iter_mut().find(|b| b.id == id))
+@@ -222,6 +236,24 @@ impl Game<'_> {
+             return;
+         };
+         let at = Vec3::new(position[0], position[1], position[2]);
++        if let Some(vehicle) = &b.mod_vehicle {
++            b.mod_correction = Some(horizon_client::mod_vehicle::VehicleCorrection::receive(
++                b.mod_correction.as_ref(),
++                at,
++                yaw,
++                tick,
++                &vehicle.profile,
++            ));
++            if at.distance_squared(b.position) > 64. {
++                b.previous = at;
++                b.position = at;
++                b.previous_yaw = yaw;
++                b.yaw = yaw;
++                b.velocity = Vec3::ZERO;
++                b.mod_correction = None;
++            }
++            return;
++        }
+         b.previous = at;
+         b.position = at;
+         b.yaw = yaw;
+diff --git a/crates/horizon-client/src/game/startup_menu.rs b/crates/horizon-client/src/game/startup_menu.rs
+index fdeb726ae..e94f35a16 100644
+--- a/crates/horizon-client/src/game/startup_menu.rs
++++ b/crates/horizon-client/src/game/startup_menu.rs
+@@ -795,4 +795,26 @@ mod tests {
+             "resource loader stopped before finishing"
+         );
+     }
++
++    /// The loader's content root is built from the settings it was handed:
++    /// with no `options.txt` yet, the enabled set must still carry the mod
++    /// list, or the resources would load vanilla while the mod starts later.
++    /// (`spawn_loader` uses `settings.mods.enabled` verbatim.)
++    #[test]
++    fn the_loader_layers_the_mods_the_settings_enabled() {
++        let dir = std::env::temp_dir().join(format!("horizon-startup-mods-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let _ = std::fs::remove_file(dir.join("options.txt"));
++        std::fs::write(dir.join("horizon-mods.txt"), "mod.superbwarfare:true\n").unwrap();
++        let settings = Settings::load(&dir.join("options.txt"));
++        assert!(
++            settings.mods.enabled.contains("superbwarfare"),
++            "the enabled set the loader receives must survive a missing options.txt"
++        );
++        // With the mod off, the set is empty: vanilla, as before.
++        std::fs::write(dir.join("horizon-mods.txt"), "mod.superbwarfare:false\n").unwrap();
++        let off = Settings::load(&dir.join("options.txt"));
++        assert!(off.mods.enabled.is_empty());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/crates/horizon-client/src/hud.rs b/crates/horizon-client/src/hud.rs
+index fda0094d8..477559a5b 100644
+--- a/crates/horizon-client/src/hud.rs
++++ b/crates/horizon-client/src/hud.rs
+@@ -386,76 +386,115 @@ impl HudAtlas {
+     /// Pack the textures under these folders of `textures/`, and for the
+     /// `full` atlas the generated sprites and the run-time slots too.
+     fn pack(root: &Path, defaults: &Path, folders: &[&str], full: bool) -> Result<Self> {
+-        let textures = root.join("assets/minecraft/textures");
+-        let default_textures =
+-            (defaults != root).then(|| defaults.join("assets/minecraft/textures"));
+         let mut files = Vec::new();
+-        for folder in folders {
+-            walk(&textures.join(folder), &mut files);
++        for entry in fs::read_dir(root.join("assets"))
++            .into_iter()
++            .flatten()
++            .flatten()
++        {
++            let Some(namespace) = entry.file_name().to_str().map(str::to_owned) else {
++                continue;
++            };
++            if namespace.is_empty()
++                || !namespace.bytes().all(|b| {
++                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
++                })
++            {
++                continue;
++            }
++            let textures = entry.path().join("textures");
++            let mut paths = Vec::new();
++            for folder in folders {
++                walk(&textures.join(folder), &mut paths);
++            }
++            files.extend(
++                paths
++                    .into_iter()
++                    .map(|path| (namespace.clone(), textures.clone(), path)),
++            );
+         }
+-        files.retain(|p| {
+-            let s = p.to_string_lossy();
++        files.retain(|(_, textures, path)| {
++            let s = path
++                .strip_prefix(textures)
++                .unwrap_or(path)
++                .to_string_lossy();
+             !s.contains("title/background") && !s.contains("realms") && !s.contains("presets")
+         });
++        files.sort();
+         type Decoded = (PackedImage, Option<TextureFlags>, Option<(u32, u32)>, bool);
+-        let decode_one = |path: &PathBuf| -> Option<Decoded> {
+-            let name = path
+-                .strip_prefix(&textures)
+-                .ok()?
+-                .with_extension("")
+-                .to_string_lossy()
+-                .replace('\\', "/");
+-            let (mut w, mut h, pixels) = decode(path).ok()?;
+-            let mcmeta = fs::read_to_string(path.with_extension("png.mcmeta")).ok();
+-            let animation = mcmeta
+-                .as_deref()
+-                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+-                .and_then(|meta| {
+-                    meta.get("animation")
+-                        .and_then(|section| AnimationMetadata::from_json(&section.to_string()).ok())
+-                });
+-            // An animated strip keeps its first frame: the region the mcmeta's
+-            // frame size picks (`AnimationMetadataSection.frameSize`), which is
+-            // the top-left square unless it names other dimensions or the
+-            // frames run along a row.
+-            let frames = name.starts_with("block/") || name.starts_with("item/");
+-            let pixels = if frames {
+-                let stride = w;
+-                let [fw, fh] = animation.as_ref().map_or([w.min(h) as i32; 2], |meta| {
+-                    meta.frame_size(w as i32, h as i32)
+-                });
+-                match (u32::try_from(fw), u32::try_from(fh)) {
+-                    (Ok(fw), Ok(fh))
+-                        if fw > 0 && fh > 0 && w % fw == 0 && h % fh == 0 && (fw, fh) != (w, h) =>
+-                    {
+-                        let side = fw.max(fh);
+-                        (w, h) = (side, side);
+-                        strip_frame(&pixels, stride, 0, 0, fw, fh)
++        let decode_one =
++            |(namespace, textures, path): &(String, PathBuf, PathBuf)| -> Option<Decoded> {
++                let relative = path
++                    .strip_prefix(textures)
++                    .ok()?
++                    .with_extension("")
++                    .to_string_lossy()
++                    .replace('\\', "/");
++                // Vanilla keeps its historic bare keys; content namespaces must
++                // remain qualified so equal texture paths cannot collide.
++                let name = if namespace == "minecraft" {
++                    relative.clone()
++                } else {
++                    format!("{namespace}:{relative}")
++                };
++                let (mut w, mut h, pixels) = decode(path).ok()?;
++                let mcmeta = fs::read_to_string(path.with_extension("png.mcmeta")).ok();
++                let animation = mcmeta
++                    .as_deref()
++                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
++                    .and_then(|meta| {
++                        meta.get("animation").and_then(|section| {
++                            AnimationMetadata::from_json(&section.to_string()).ok()
++                        })
++                    });
++                // An animated strip keeps its first frame: the region the mcmeta's
++                // frame size picks (`AnimationMetadataSection.frameSize`), which is
++                // the top-left square unless it names other dimensions or the
++                // frames run along a row.
++                let frames = relative.starts_with("block/") || relative.starts_with("item/");
++                let pixels = if frames {
++                    let stride = w;
++                    let [fw, fh] = animation.as_ref().map_or([w.min(h) as i32; 2], |meta| {
++                        meta.frame_size(w as i32, h as i32)
++                    });
++                    match (u32::try_from(fw), u32::try_from(fh)) {
++                        (Ok(fw), Ok(fh))
++                            if fw > 0
++                                && fh > 0
++                                && w % fw == 0
++                                && h % fh == 0
++                                && (fw, fh) != (w, h) =>
++                        {
++                            let side = fw.max(fh);
++                            (w, h) = (side, side);
++                            strip_frame(&pixels, stride, 0, 0, fw, fh)
++                        }
++                        _ => pixels,
+                     }
+-                    _ => pixels,
+-                }
+-            } else {
+-                pixels
++                } else {
++                    pixels
++                };
++                // The default texture's size, when a pack's differs from it.
++                let default_texture = (defaults != root)
++                    .then(|| defaults.join(format!("assets/{namespace}/textures/{relative}.png")));
++                let gui_size = default_texture
++                    .as_deref()
++                    .and_then(png_size)
++                    .map(|(dw, dh)| {
++                        let side = dw.min(dh);
++                        if frames { (side, side) } else { (dw, dh) }
++                    })
++                    .filter(|&size| size != (w, h));
++                let flags = mcmeta.as_deref().and_then(TextureFlags::from_mcmeta);
++                let animated = frames && animation.is_some();
++                let (gw, gh) = gui_size.unwrap_or((w, h));
++                (gw <= 1024 && (gh <= 512 || relative.starts_with("font/"))).then_some((
++                    (name, w, h, pixels),
++                    flags,
++                    gui_size,
++                    animated,
++                ))
+             };
+-            // The default texture's size, when a pack's differs from it.
+-            let gui_size = default_textures
+-                .as_ref()
+-                .and_then(|d| png_size(&d.join(format!("{name}.png"))))
+-                .map(|(dw, dh)| {
+-                    let side = dw.min(dh);
+-                    if frames { (side, side) } else { (dw, dh) }
+-                })
+-                .filter(|&size| size != (w, h));
+-            let flags = mcmeta.as_deref().and_then(TextureFlags::from_mcmeta);
+-            let animated = frames && animation.is_some();
+-            let (gw, gh) = gui_size.unwrap_or((w, h));
+-            (gw <= 1024 && (gh <= 512 || name.starts_with("font/"))).then_some((
+-                (name, w, h, pixels),
+-                flags,
+-                gui_size,
+-                animated,
+-            ))
+-        };
+         let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
+         let chunk = files.len().div_ceil(threads).max(1);
+         let decoded: Vec<_> = std::thread::scope(|scope| {
+@@ -559,7 +598,12 @@ impl HudAtlas {
+             let Some(rect) = sprites.get(&name).copied() else {
+                 continue;
+             };
+-            let layer = loaded.insert(root, &format!("minecraft:{name}"))?;
++            let texture = if name.contains(':') {
++                name.clone()
++            } else {
++                format!("minecraft:{name}")
++            };
++            let layer = loaded.insert(root, &texture)?;
+             let Some(animation) = loaded.animations.iter().find(|a| a.layer == layer).cloned()
+             else {
+                 continue;
+@@ -1628,6 +1672,53 @@ mod tests {
+         atlas.pixels[at..at + 4].try_into().unwrap()
+     }
+     #[test]
++    fn foreign_vehicle_textures_keep_their_namespaces_and_only_scan_atlas_folders() {
++        let root = std::env::temp_dir().join(format!(
++            "horizon-foreign-vehicle-atlas-{}",
++            std::process::id()
++        ));
++        for (namespace, color) in [
++            ("minecraft", [255, 0, 0, 255]),
++            ("first_mod", [0, 255, 0, 255]),
++            ("second_mod", [0, 0, 255, 255]),
++        ] {
++            let path = root.join(format!(
++                "assets/{namespace}/textures/entity/vehicle/truck.png"
++            ));
++            fs::create_dir_all(path.parent().unwrap()).unwrap();
++            write_strip(&path, 4, 4, &[color], None);
++        }
++        // Resource directories outside the atlas's selected folders are not
++        // walked, even when they happen to hold PNG files.
++        let unrelated = root.join("assets/first_mod/textures/unrelated/truck.png");
++        fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
++        write_strip(&unrelated, 4, 4, &[[255; 4]], None);
++        let animated = root.join("assets/first_mod/textures/block/beacon.png");
++        fs::create_dir_all(animated.parent().unwrap()).unwrap();
++        write_strip(
++            &animated,
++            4,
++            8,
++            &[[255, 0, 0, 255], [0, 0, 255, 255]],
++            Some(r#"{"animation":{"frames":[1,0]}}"#),
++        );
++        let atlas = HudAtlas::build(&root).unwrap();
++        let _ = fs::remove_dir_all(&root);
++        for (key, color) in [
++            ("entity/vehicle/truck", [255, 0, 0, 255]),
++            ("first_mod:entity/vehicle/truck", [0, 255, 0, 255]),
++            ("second_mod:entity/vehicle/truck", [0, 0, 255, 255]),
++        ] {
++            let rect = atlas.sprites[key];
++            assert_eq!(rect.texels((atlas.width, atlas.height)), (4, 4));
++            assert_eq!(texel_at(&atlas, rect, 0, 0), color, "{key}");
++        }
++        assert!(!atlas.sprites.contains_key("first_mod:unrelated/truck"));
++        let animated = atlas.sprites["first_mod:block/beacon"];
++        assert_eq!(texel_at(&atlas, animated, 0, 0), [0, 0, 255, 255]);
++        assert_eq!(atlas.sprite_animations.len(), 1);
++    }
++    #[test]
+     fn animated_block_sprites_register_and_pack_their_first_mcmeta_frame() {
+         let root = animated_root();
+         let atlas = HudAtlas::build(&root).unwrap();
 diff --git a/crates/horizon-client/src/lan/conn.rs b/crates/horizon-client/src/lan/conn.rs
 index 99b70e065..ed70d1de8 100644
 --- a/crates/horizon-client/src/lan/conn.rs
@@ -1167,21 +1963,83 @@ index 99b70e065..ed70d1de8 100644
              c,
              cfg::Clientbound::CustomPayload(cfg::CustomPayload {
 diff --git a/crates/horizon-client/src/lib.rs b/crates/horizon-client/src/lib.rs
-index d4ef4c209..d2fa67967 100644
+index d4ef4c209..5ad373dd6 100644
 --- a/crates/horizon-client/src/lib.rs
 +++ b/crates/horizon-client/src/lib.rs
-@@ -212,3 +212,5 @@ pub use horizon_items::enchant;
+@@ -212,3 +212,7 @@ pub use horizon_items::enchant;
  pub use horizon_items::item_data;
  pub use horizon_items::items;
  pub use horizon_items::random_sequences;
 +
 +pub mod mod_vehicle;
++
++pub mod mod_vehicle_visual;
+diff --git a/crates/horizon-client/src/mobs.rs b/crates/horizon-client/src/mobs.rs
+index 5d3b8dfc1..b46e7fa6b 100644
+--- a/crates/horizon-client/src/mobs.rs
++++ b/crates/horizon-client/src/mobs.rs
+@@ -214,7 +214,7 @@ pub struct Part {
+     pub children: Vec<Part>,
+ }
+ impl Part {
+-    fn parse(name: &str, v: &Value) -> Self {
++    pub(crate) fn parse(name: &str, v: &Value) -> Self {
+         let pose: Vec<f32> = v["pose"]
+             .as_array()
+             .into_iter()
+diff --git a/crates/horizon-client/src/mod_list.rs b/crates/horizon-client/src/mod_list.rs
+index 325839738..0d19bda82 100644
+--- a/crates/horizon-client/src/mod_list.rs
++++ b/crates/horizon-client/src/mod_list.rs
+@@ -11,6 +11,14 @@ pub const FILE: &str = "horizon-mods.txt";
+ /// The folder holding `.hmod` files, beside `options.txt`.
+ pub const DIR: &str = "horizon-mods";
+ 
++/// The folder the installed `.hmod` files live in: `DIR` beside `options.txt`,
++/// so the list and the files are always found in the same game directory.
++/// Every caller that needs the mod folder (the list, the runtime, and content
++/// loading) resolves it here, never from the process's current directory.
++pub fn dir(game_dir: &Path) -> std::path::PathBuf {
++    game_dir.join(DIR)
++}
++
+ #[derive(Clone, Debug, Default, PartialEq)]
+ pub struct ModList {
+     /// Ids of the mods the player turned on.
+@@ -153,4 +161,27 @@ mod tests {
+         list.toggle(0);
+         assert!(!list.is_on(0));
+     }
++
++    /// The mod folder is `DIR` beside `options.txt`, so the list
++    /// (`ModList::load`) and the files (content loading, the runtime) resolve
++    /// it the same way whatever the process's current directory is.
++    #[test]
++    fn the_mod_folder_is_beside_options_txt() {
++        assert_eq!(
++            dir(Path::new("/games/scratch")),
++            Path::new("/games/scratch/horizon-mods")
++        );
++    }
++
++    /// A mod list is read from the given game directory, never from the
++    /// process's current directory: a run in another cwd still finds the
++    /// `horizon-mods.txt` beside its `options.txt`.
++    #[test]
++    fn load_reads_beside_the_given_directory() {
++        let dir = std::env::temp_dir().join(format!("horizon-mod-list-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join(FILE), "mod.superbwarfare:true\n").unwrap();
++        assert!(ModList::load(&dir).enabled.contains("superbwarfare"));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
 diff --git a/crates/horizon-client/src/mod_vehicle.rs b/crates/horizon-client/src/mod_vehicle.rs
 new file mode 100644
-index 000000000..c041a1b46
+index 000000000..fe18c2435
 --- /dev/null
 +++ b/crates/horizon-client/src/mod_vehicle.rs
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,676 @@
 +//! Generic data-only ground vehicle profile. Mods supply their own tuning and
 +//! cuboids; the engine supplies native passengers, persistence and collisions.
 +use serde::{Deserialize, Serialize};
@@ -1228,7 +2086,7 @@ index 000000000..c041a1b46
 +        (owned(&p.definition)
 +            && owned(&p.item)
 +            && range(p.width, 0.5, 6.)
-+            && range(p.length, 0.5, 8.)
++            && range(p.length, 0.5, 12.)
 +            && range(p.height, 0.3, 5.)
 +            && range(p.seat_height, 0., p.height)
 +            && range(p.seat_z, -p.length / 2., p.length / 2.)
@@ -1446,6 +2304,875 @@ index 000000000..c041a1b46
 +        assert_eq!(restored.profile.boxes[0].color, 0xff112233);
 +    }
 +}
++
++/// Chassis collision uses a conservative world-axis box around the rotated
++/// footprint; rendering and seating retain the exact local orientation.
++pub fn chassis_bounds(
++    profile: &VehicleProfile,
++    at: horizon_core::geometry::Vec3,
++    yaw: f32,
++) -> horizon_core::geometry::Aabb {
++    use horizon_core::geometry::{Aabb, Vec3};
++    let (sin, cos) = f64::from(yaw).to_radians().sin_cos();
++    let half_x = (profile.width * cos.abs() + profile.length * sin.abs()) * 0.5;
++    let half_z = (profile.length * cos.abs() + profile.width * sin.abs()) * 0.5;
++    Aabb::new(
++        Vec3::new(at.x - half_x, at.y, at.z - half_z),
++        Vec3::new(at.x + half_x, at.y + profile.height, at.z + half_z),
++    )
++}
++
++/// Collision probes needed to place a ground chassis. Implementations must
++/// reject unloaded cells and query real collision surfaces, not outline boxes.
++pub trait GroundPlacementWorld {
++    fn support_height(&mut self, x: f64, z: f64, ceiling: f64, floor: f64) -> Option<f64>;
++    fn unobstructed(&mut self, bounds: horizon_core::geometry::Aabb) -> bool;
++}
++/// Settle all corners on a supported surface. A chassis cannot be deployed
++/// against a wall/ceiling, over a ledge, or across a step taller than it can climb.
++pub fn ground_placement(
++    profile: &VehicleProfile,
++    hit: horizon_core::geometry::Vec3,
++    normal: [i32; 3],
++    yaw: f32,
++    world: &mut impl GroundPlacementWorld,
++) -> Option<horizon_core::geometry::Vec3> {
++    use horizon_core::geometry::Vec3;
++    if normal != [0, 1, 0]
++        || ![hit.x, hit.y, hit.z, f64::from(yaw)]
++            .iter()
++            .all(|n| n.is_finite())
++    {
++        return None;
++    }
++    let (sin, cos) = f64::from(yaw).to_radians().sin_cos();
++    // Keep probes just inside the wheels/footprint so a legal block edge does
++    // not fail because of floating point contact with the neighbouring cell.
++    let x = (profile.width * 0.5 - 0.08).max(0.1);
++    let z = (profile.length * 0.5 - 0.08).max(0.1);
++    let mut bottom = f64::NEG_INFINITY;
++    let mut lowest = f64::INFINITY;
++    // Sample the wheel lines and centre at half-block intervals so a long
++    // chassis cannot bridge an unsupported cell between its corners.
++    let rows = (z * 4.).ceil().max(1.) as usize;
++    let samples = (0..=rows).flat_map(|row| {
++        let local_z = -z + 2. * z * row as f64 / rows as f64;
++        [-x, 0., x]
++            .into_iter()
++            .map(move |local_x| (local_x, local_z))
++    });
++    for (local_x, local_z) in samples {
++        let px = hit.x + local_x * cos - local_z * sin;
++        let pz = hit.z + local_x * sin + local_z * cos;
++        let h = world.support_height(px, pz, hit.y + 0.65, hit.y - 1.0)?;
++        if !h.is_finite() {
++            return None;
++        }
++        bottom = bottom.max(h);
++        lowest = lowest.min(h);
++    }
++    if bottom - lowest > 0.6 + 1e-6 {
++        return None;
++    }
++    let at = Vec3::new(hit.x, bottom + 0.002, hit.z);
++    world
++        .unobstructed(chassis_bounds(profile, at, yaw))
++        .then_some(at)
++}
++
++#[derive(Clone, Copy, Debug)]
++pub struct DriveMotion {
++    pub velocity: horizon_core::geometry::Vec3,
++    pub yaw: f32,
++    pub turn: f32,
++}
++/// Signed longitudinal motion with tyre grip. Opposite throttle brakes before
++/// reverse engages; reverse turns the chassis the opposite way. All values are
++/// in blocks/tick and degrees/tick, independent of rendered frame rate.
++pub fn ground_drive(
++    profile: &VehicleProfile,
++    velocity: horizon_core::geometry::Vec3,
++    yaw: f32,
++    input: [bool; 4],
++    grounded: bool,
++) -> DriveMotion {
++    use horizon_core::geometry::Vec3;
++    let [left, right, forward, back] = input;
++    let (sin, cos) = f64::from(yaw).to_radians().sin_cos();
++    let mut longitudinal = -sin * velocity.x + cos * velocity.z;
++    let mut lateral = cos * velocity.x + sin * velocity.z;
++    let throttle = f64::from(i32::from(forward) - i32::from(back));
++    longitudinal *= profile.drag;
++    lateral *= if grounded { 0.25 } else { 0.98 };
++    if grounded {
++        let brake = forward && back || throttle != 0. && longitudinal * throttle < -0.002;
++        if brake {
++            let amount = profile.acceleration * 3.;
++            longitudinal = longitudinal.signum() * (longitudinal.abs() - amount).max(0.);
++        } else {
++            longitudinal += throttle * profile.acceleration;
++        }
++    }
++    longitudinal = longitudinal.clamp(-profile.max_speed * 0.45, profile.max_speed);
++    if throttle == 0. && longitudinal.abs() < 0.001 {
++        longitudinal = 0.;
++    }
++    let steer = f64::from(i32::from(right) - i32::from(left));
++    let turn = if grounded && longitudinal.abs() > 0.002 {
++        (steer
++            * longitudinal.signum()
++            * f64::from(profile.turn_speed)
++            * (longitudinal.abs() / profile.max_speed)
++                .sqrt()
++                .clamp(0.2, 1.)) as f32
++    } else {
++        0.
++    };
++    let next_yaw = yaw + turn;
++    let (sin, cos) = f64::from(next_yaw).to_radians().sin_cos();
++    let mut next = Vec3::new(
++        -sin * longitudinal + cos * lateral,
++        velocity.y,
++        cos * longitudinal + sin * lateral,
++    );
++    let horizontal = (next.x * next.x + next.z * next.z).sqrt();
++    if horizontal > profile.max_speed {
++        next.x *= profile.max_speed / horizontal;
++        next.z *= profile.max_speed / horizontal;
++    }
++    DriveMotion {
++        velocity: next,
++        yaw: next_yaw,
++        turn,
++    }
++}
++
++/// Client-only prediction state. Server positions remain the authority; this
++/// merely eases small transport corrections and snaps genuine teleports.
++#[derive(Clone, Debug)]
++pub struct VehicleCorrection {
++    position: horizon_core::geometry::Vec3,
++    yaw: f32,
++    velocity: horizon_core::geometry::Vec3,
++    yaw_rate: f32,
++    received_tick: u64,
++    remaining: u8,
++}
++fn angle_delta(to: f32, from: f32) -> f32 {
++    (to - from + 180.).rem_euclid(360.) - 180.
++}
++impl VehicleCorrection {
++    /// Capture an authenticated server pose and a bounded motion estimate.
++    /// Invalid poses are ignored by callers before capture; large errors snap
++    /// in correct() instead of gliding through intervening obstacles.
++    pub fn receive(
++        previous: Option<&Self>,
++        position: horizon_core::geometry::Vec3,
++        yaw: f32,
++        tick: u64,
++        profile: &VehicleProfile,
++    ) -> Self {
++        use horizon_core::geometry::Vec3;
++        let (velocity, yaw_rate) = previous
++            .filter(|old| position.distance_squared(old.position) <= 64.)
++            .map_or((Vec3::ZERO, 0.), |old| {
++                let dt = tick.saturating_sub(old.received_tick).max(1) as f64;
++                let mut v = position.subtract(old.position).scale(1. / dt);
++                let horizontal = (v.x * v.x + v.z * v.z).sqrt();
++                if horizontal > profile.max_speed {
++                    v.x *= profile.max_speed / horizontal;
++                    v.z *= profile.max_speed / horizontal;
++                }
++                v.y = v.y.clamp(-3., 3.);
++                (
++                    v,
++                    (angle_delta(yaw, old.yaw) / dt as f32)
++                        .clamp(-profile.turn_speed, profile.turn_speed),
++                )
++            });
++        Self {
++            position,
++            yaw,
++            velocity,
++            yaw_rate,
++            received_tick: tick,
++            remaining: 3,
++        }
++    }
++    pub fn correct(
++        &mut self,
++        position: &mut horizon_core::geometry::Vec3,
++        yaw: &mut f32,
++        velocity: &mut horizon_core::geometry::Vec3,
++        tick: u64,
++    ) {
++        if self.remaining == 0 {
++            return;
++        }
++        if position.distance_squared(self.position) > 64. {
++            *position = self.position;
++            *yaw += angle_delta(self.yaw, *yaw);
++            *velocity = self.velocity;
++            self.remaining = 0;
++            return;
++        }
++        let age = tick.saturating_sub(self.received_tick).min(2) as f64 + 1.;
++        let target = self.position.add_vector(self.velocity.scale(age));
++        let gain = 1. / f64::from(self.remaining);
++        *position = position.add_vector(target.subtract(*position).scale(gain));
++        *yaw += angle_delta(self.yaw + self.yaw_rate * age as f32, *yaw) * gain as f32;
++        *velocity = velocity
++            .scale(1. - 0.25 * gain)
++            .add_vector(self.velocity.scale(0.25 * gain));
++        self.remaining -= 1;
++    }
++}
++
++#[cfg(test)]
++mod chassis_tests {
++    use super::*;
++    use horizon_core::geometry::{Aabb, Vec3};
++    fn profile() -> VehicleProfile {
++        serde_json::from_str(r#"{"definition":"test:car","item":"test:car","width":2,"length":3.2,"height":1.6,"seat_height":0.85,"acceleration":0.035,"drag":0.96,"max_speed":0.65,"turn_speed":3,"max_health":175,"boxes":[{"min":[-1,0,-1.6],"max":[1,1.6,1.6],"color":4294967295}]}"#).unwrap()
++    }
++    struct Ground {
++        kind: u8,
++        free: bool,
++    }
++    impl GroundPlacementWorld for Ground {
++        fn support_height(&mut self, x: f64, _z: f64, _ceiling: f64, _floor: f64) -> Option<f64> {
++            match self.kind {
++                1 if x > 0.5 => None,
++                2 => Some(if x > 0. { 0.5 } else { 0. }),
++                3 => Some(if x > 0. { 1. } else { 0. }),
++                _ => Some(0.),
++            }
++        }
++        fn unobstructed(&mut self, _: Aabb) -> bool {
++            self.free
++        }
++    }
++    #[test]
++    fn placement_rejects_walls_unsupported_edges_and_large_steps() {
++        let p = profile();
++        let at = Vec3::new(0., 0., 0.);
++        assert!(
++            ground_placement(
++                &p,
++                at,
++                [1, 0, 0],
++                0.,
++                &mut Ground {
++                    kind: 0,
++                    free: true
++                }
++            )
++            .is_none()
++        );
++        assert!(
++            ground_placement(
++                &p,
++                at,
++                [0, 1, 0],
++                0.,
++                &mut Ground {
++                    kind: 1,
++                    free: true
++                }
++            )
++            .is_none()
++        );
++        assert!(
++            ground_placement(
++                &p,
++                at,
++                [0, 1, 0],
++                0.,
++                &mut Ground {
++                    kind: 3,
++                    free: true
++                }
++            )
++            .is_none()
++        );
++        assert!(
++            ground_placement(
++                &p,
++                at,
++                [0, 1, 0],
++                0.,
++                &mut Ground {
++                    kind: 0,
++                    free: false
++                }
++            )
++            .is_none()
++        );
++        let settled = ground_placement(
++            &p,
++            at,
++            [0, 1, 0],
++            0.,
++            &mut Ground {
++                kind: 2,
++                free: true,
++            },
++        )
++        .unwrap();
++        assert!((settled.y - 0.502).abs() < 1e-9);
++    }
++    #[test]
++    fn steering_tracks_forward_and_reverses_while_backing() {
++        let p = profile();
++        let f = ground_drive(
++            &p,
++            Vec3::new(0., 0., 0.3),
++            0.,
++            [false, true, true, false],
++            true,
++        );
++        assert!(f.turn > 0. && f.velocity.x < 0.);
++        let r = ground_drive(
++            &p,
++            Vec3::new(0., 0., -0.2),
++            0.,
++            [false, true, false, true],
++            true,
++        );
++        assert!(r.turn < 0.);
++        let mut velocity = Vec3::new(0., 0., 0.3);
++        let mut previous = velocity.z;
++        for _ in 0..3 {
++            velocity = ground_drive(&p, velocity, 0., [false, false, false, true], true).velocity;
++            assert!(velocity.z >= 0. && velocity.z < previous);
++            previous = velocity.z;
++        }
++        let mut velocity = Vec3::ZERO;
++        for _ in 0..100 {
++            velocity = ground_drive(&p, velocity, 0., [false, false, false, true], true).velocity;
++        }
++        assert!(velocity.z < -0.1 && velocity.z >= -p.max_speed * 0.45 - 1e-9);
++        for _ in 0..100 {
++            velocity = ground_drive(&p, velocity, 0., [false, false, true, false], true).velocity;
++        }
++        assert!(velocity.z > 0.6 && velocity.z <= p.max_speed + 1e-9);
++    }
++    #[test]
++    fn prediction_corrections_are_smooth_wrap_yaw_and_snap_teleports() {
++        let p = profile();
++        let mut c = VehicleCorrection::receive(None, Vec3::ZERO, -179., 1, &p);
++        let (mut at, mut yaw, mut velocity) = (Vec3::new(0.9, 0., 0.), 179., Vec3::ZERO);
++        c.correct(&mut at, &mut yaw, &mut velocity, 1);
++        assert!(at.x > 0. && at.x < 0.9);
++        assert!((yaw - 179.).abs() < 2.);
++        c.correct(&mut at, &mut yaw, &mut velocity, 2);
++        c.correct(&mut at, &mut yaw, &mut velocity, 3);
++        assert_eq!(at, Vec3::ZERO);
++        assert!((angle_delta(yaw, -179.)).abs() < 1e-5);
++        let mut c = VehicleCorrection::receive(None, Vec3::new(20., 0., 0.), 0., 4, &p);
++        c.correct(&mut at, &mut yaw, &mut velocity, 4);
++        assert_eq!(at.x, 20.);
++    }
++    #[test]
++    fn long_chassis_requires_support_between_corners_and_after_rotation() {
++        struct Road {
++            hole: bool,
++        }
++        impl GroundPlacementWorld for Road {
++            fn support_height(&mut self, x: f64, z: f64, _: f64, _: f64) -> Option<f64> {
++                (x.abs() <= 1.5
++                    && z.abs() <= 6.
++                    && !(self.hole && x.abs() < 0.1 && z > 1. && z < 2.))
++                    .then_some(100.)
++            }
++            fn unobstructed(&mut self, _: Aabb) -> bool {
++                true
++            }
++        }
++        let mut p = profile();
++        p.width = 2.5;
++        p.length = 8.8;
++        let at = Vec3::new(0., 100., 0.);
++        assert!(ground_placement(&p, at, [0, 1, 0], 0., &mut Road { hole: false }).is_some());
++        assert!(ground_placement(&p, at, [0, 1, 0], 90., &mut Road { hole: false }).is_none());
++        assert!(ground_placement(&p, at, [0, 1, 0], 0., &mut Road { hole: true }).is_none());
++    }
++    #[test]
++    fn prediction_does_not_infer_speed_from_a_teleport_or_shortened_sample_gap() {
++        let p = profile();
++        let old = VehicleCorrection::receive(None, Vec3::ZERO, 0., 1, &p);
++        let mut c = VehicleCorrection::receive(Some(&old), Vec3::new(20., 0., 0.), 90., 2, &p);
++        let (mut at, mut yaw, mut velocity) = (Vec3::new(20., 0., 0.), 90., Vec3::ZERO);
++        for tick in 2..5 {
++            c.correct(&mut at, &mut yaw, &mut velocity, tick);
++        }
++        assert_eq!(at, Vec3::new(20., 0., 0.));
++        assert_eq!(yaw, 90.);
++        assert_eq!(velocity, Vec3::ZERO);
++
++        let mut c = VehicleCorrection::receive(Some(&old), Vec3::new(1., 0., 0.), 0., 21, &p);
++        let (mut at, mut yaw, mut velocity) = (Vec3::new(1., 0., 0.), 0., Vec3::ZERO);
++        c.correct(&mut at, &mut yaw, &mut velocity, 21);
++        assert!((at.x - (1. + 0.05 / 3.)).abs() < 1e-9);
++    }
++}
+diff --git a/crates/horizon-client/src/mod_vehicle_visual.rs b/crates/horizon-client/src/mod_vehicle_visual.rs
+new file mode 100644
+index 000000000..b3902f77d
+--- /dev/null
++++ b/crates/horizon-client/src/mod_vehicle_visual.rs
+@@ -0,0 +1,451 @@
++//! Static textured model assets for mod ground chassis. Geometry stays in the
++//! resource pack; only the definition id travels with a native vehicle.
++use crate::mobs::Part;
++use serde_json::Value;
++use std::{collections::HashMap, path::Path};
++
++pub struct VehicleModel {
++    pub part: Part,
++    pub texture: String,
++    pub wheel_parts: Vec<String>,
++    pub steer_parts: Vec<String>,
++    pub wheel_radius: f32,
++    pub length: f32,
++}
++#[derive(Default)]
++pub struct VehicleModels {
++    models: HashMap<String, VehicleModel>,
++}
++impl VehicleModels {
++    pub fn get(&self, definition: &str) -> Option<&VehicleModel> {
++        self.models.get(definition)
++    }
++    /// `assets/<namespace>/models/entity/<path>.json`, a native Part document
++    /// with a texture resource id. Invalid or oversized documents draw fallback.
++    pub fn load(root: &Path) -> Self {
++        let mut result = Self::default();
++        let Ok(namespaces) = std::fs::read_dir(root.join("assets")) else {
++            return result;
++        };
++        for namespace in namespaces.flatten() {
++            let name = namespace.file_name().to_string_lossy().into_owned();
++            if name == "minecraft" || !id_part(&name, false) {
++                continue;
++            }
++            let base = namespace.path().join("models/entity");
++            result.walk(&name, &base, &base, 0);
++        }
++        result
++    }
++    fn walk(&mut self, namespace: &str, base: &Path, dir: &Path, depth: usize) {
++        if depth > 8 || self.models.len() >= 256 {
++            return;
++        }
++        let Ok(files) = std::fs::read_dir(dir) else {
++            return;
++        };
++        for file in files.flatten() {
++            let Ok(kind) = file.file_type() else {
++                continue;
++            };
++            let path = file.path();
++            if kind.is_dir() {
++                self.walk(namespace, base, &path, depth + 1);
++            } else if kind.is_file() && path.extension().is_some_and(|s| s == "json") {
++                let Ok(meta) = file.metadata() else {
++                    continue;
++                };
++                if meta.len() > 8 * 1024 * 1024 {
++                    continue;
++                }
++                let Ok(relative) = path.strip_prefix(base) else {
++                    continue;
++                };
++                let key = relative
++                    .with_extension("")
++                    .to_string_lossy()
++                    .replace('\\', "/");
++                if !id_part(&key, true) {
++                    continue;
++                }
++                let Ok(bytes) = std::fs::read(&path) else {
++                    continue;
++                };
++                if let Some(model) = parse(&bytes, namespace) {
++                    self.models.insert(format!("{namespace}:{key}"), model);
++                }
++            }
++        }
++    }
++}
++fn id_part(s: &str, slash: bool) -> bool {
++    !s.is_empty()
++        && s.len() <= 128
++        && !s.split('/').any(|p| p.is_empty() || p == "." || p == "..")
++        && s.bytes().all(|b| {
++            b.is_ascii_lowercase()
++                || b.is_ascii_digit()
++                || b == b'_'
++                || b == b'-'
++                || b == b'.'
++                || slash && b == b'/'
++        })
++}
++fn parse(bytes: &[u8], owner: &str) -> Option<VehicleModel> {
++    let value: Value = serde_json::from_slice(bytes).ok()?;
++    let texture = value.get("texture")?.as_str()?;
++    let (namespace, path) = texture.split_once(':')?;
++    if namespace != owner || !id_part(path, true) {
++        return None;
++    }
++    let node = value.get("model")?;
++    let mut budget = 20_000;
++    if !valid_node(node, 0, &mut budget) {
++        return None;
++    }
++    let part = Part::parse("vehicle", node);
++    // Empty geometry would draw nothing at all, leaving a vehicle invisible
++    // with no fallback box behind it: reject so the fallback runs.
++    if part.polygons.is_empty() && !has_geometry(&part) {
++        return None;
++    }
++    let names = |key: &str| -> Option<Vec<String>> {
++        match value.get(key) {
++            None => Some(vec![]),
++            Some(v) => {
++                let a = v.as_array()?;
++                if a.len() > 16 {
++                    return None;
++                }
++                a.iter()
++                    .map(|v| v.as_str().filter(|s| s.len() <= 128).map(String::from))
++                    .collect()
++            }
++        }
++    };
++    // A part reference that names no bone in the tree is a broken document;
++    // keeping it would silently animate nothing (or the wrong bone).
++    let wheel_parts = names("wheel_parts")?;
++    let steer_parts = names("steer_parts")?;
++    let mut tree = HashMap::new();
++    collect_names(&part, &mut tree);
++    if !wheel_parts
++        .iter()
++        .chain(&steer_parts)
++        .all(|n| tree.contains_key(n))
++    {
++        return None;
++    }
++    let length = value
++        .get("bounds")
++        .and_then(|v| v.get(2))
++        .and_then(Value::as_f64)
++        .unwrap_or(1.);
++    if !length.is_finite() || !(0.1..=16.).contains(&length) {
++        return None;
++    }
++    let radius = value
++        .get("wheel_radius")
++        .and_then(Value::as_f64)
++        .unwrap_or(0.35);
++    if !radius.is_finite() || !(0.05..=2.).contains(&radius) {
++        return None;
++    }
++    Some(VehicleModel {
++        part,
++        texture: texture.into(),
++        wheel_parts,
++        steer_parts,
++        wheel_radius: radius as f32,
++        length: length as f32,
++    })
++}
++/// Whether the tree holds any polygon at all (a root with no polygons of its
++/// own still draws when a descendant has some).
++fn has_geometry(part: &Part) -> bool {
++    !part.polygons.is_empty() || part.children.iter().any(has_geometry)
++}
++/// Every part name in the tree; a duplicated name still counts as present.
++fn collect_names(part: &Part, out: &mut HashMap<String, ()>) {
++    out.insert(part.name.clone(), ());
++    for child in &part.children {
++        collect_names(child, out);
++    }
++}
++fn numbers(value: &Value, len: usize, bound: f64) -> bool {
++    value.as_array().is_some_and(|a| {
++        a.len() == len
++            && a.iter().all(|n| {
++                n.as_f64()
++                    .is_some_and(|n| n.is_finite() && n.abs() <= bound)
++            })
++    })
++}
++fn valid_node(value: &Value, depth: usize, budget: &mut usize) -> bool {
++    if depth > 64 || *budget == 0 || !value.is_object() {
++        return false;
++    }
++    *budget -= 1;
++    if value.get("normals").is_some() && value.get("polygons").is_none() {
++        return false;
++    }
++    if let Some(pose) = value.get("pose") {
++        if !numbers(pose, 9, 4096.) {
++            return false;
++        }
++        if pose
++            .as_array()
++            .is_some_and(|a| a[6..].iter().any(|n| n.as_f64().unwrap_or(0.).abs() < 1e-6))
++        {
++            return false;
++        }
++    }
++    if let Some(polys) = value.get("polygons") {
++        let Some(polys) = polys.as_array() else {
++            return false;
++        };
++        if polys.len() > *budget {
++            return false;
++        }
++        *budget -= polys.len();
++        if !polys.iter().all(|p| {
++            p.as_array()
++                .is_some_and(|v| v.len() == 4 && v.iter().all(|v| numbers(v, 5, 4096.)))
++        }) {
++            return false;
++        }
++        if let Some(normals) = value.get("normals")
++            && !normals
++                .as_array()
++                .is_some_and(|n| n.len() == polys.len() && n.iter().all(|v| numbers(v, 3, 1.001)))
++        {
++            return false;
++        }
++    }
++    if let Some(children) = value.get("children") {
++        let Some(children) = children.as_object() else {
++            return false;
++        };
++        if !children
++            .iter()
++            .all(|(name, node)| name.len() <= 128 && valid_node(node, depth + 1, budget))
++        {
++            return false;
++        }
++    }
++    true
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    const VALID: &[u8] = br#"{"texture":"demo:entity/vehicle/car","model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}"#;
++    #[test]
++    fn untrusted_part_documents_are_bounded_before_native_parsing() {
++        assert_eq!(parse(VALID, "demo").unwrap().part.polygons.len(), 1);
++        assert!(parse(VALID, "other").is_none());
++        assert!(
++            parse(
++                br#"{"texture":"demo:car","model":{"polygons":[[[0]]]}}"#,
++                "demo"
++            )
++            .is_none()
++        );
++        assert!(parse(br#"{"texture":"demo:../car","model":{}}"#, "demo").is_none());
++        assert!(
++            parse(
++                br#"{"texture":"demo:car","model":{"pose":[0,0,0,0,0,0,0,1,1]}}"#,
++                "demo"
++            )
++            .is_none()
++        );
++    }
++    /// A texture must stay inside the namespace of the document that names it.
++    #[test]
++    fn texture_namespace_is_enforced() {
++        for bad in [
++            &br#"{"texture":"other:entity/car","model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}"#[..],
++            &br#"{"texture":"demo:Entity/Car","model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}"#[..],
++            &br#"{"texture":"demo:entity//car","model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}"#[..],
++            &br#"{"texture":"demo:a:b","model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}"#[..],
++            &br#"{"texture":"demo:","model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}"#[..],
++        ] {
++            assert!(parse(bad, "demo").is_none(), "{:?}", std::str::from_utf8(bad));
++        }
++        assert!(parse(VALID, "demo").is_some());
++    }
++    /// Geometry that draws nothing must not suppress the fallback box.
++    #[test]
++    fn empty_geometry_is_rejected() {
++        assert!(parse(br#"{"texture":"demo:car","model":{}}"#, "demo").is_none());
++        assert!(
++            parse(
++                br#"{"texture":"demo:car","model":{"children":{"wheel":{}}}}"#,
++                "demo"
++            )
++            .is_none()
++        );
++        // A polygon on a child is enough: the model draws.
++        assert!(
++            parse(
++                br#"{"texture":"demo:car","model":{"children":{"wheel":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}}}"#,
++                "demo"
++            )
++            .is_some()
++        );
++    }
++    /// Wheel and steer references are checked against the real tree names.
++    #[test]
++    fn part_references_must_exist_in_the_tree() {
++        let doc = |extra: &str| {
++            format!(
++                r#"{{"texture":"demo:car","model":{{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]],"children":{{"wheel_front":{{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}}}}}{extra}}}"#
++            )
++        };
++        // Missing parts and unknown names are malformed.
++        assert!(parse(doc(r#","wheel_parts":["wheel_rear"]"#).as_bytes(), "demo").is_none());
++        assert!(parse(doc(r#","steer_parts":["nope"]"#).as_bytes(), "demo").is_none());
++        // A nested child counts, and an empty list is fine.
++        assert!(
++            parse(
++                doc(r#","wheel_parts":["wheel_front"],"steer_parts":[]"#).as_bytes(),
++                "demo"
++            )
++            .is_some()
++        );
++        // The root itself is a valid reference.
++        assert!(parse(doc(r#","wheel_parts":["vehicle"]"#).as_bytes(), "demo").is_some());
++    }
++    /// The walk keeps its bounds: too many names, wrong types or oversized
++    /// lists are rejected instead of parsed.
++    #[test]
++    fn malformed_reference_lists_are_rejected() {
++        let base = r#""model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}"#;
++        assert!(
++            parse(
++                format!(r#"{{"texture":"demo:car",{base},"wheel_parts":"wheel"}}"#).as_bytes(),
++                "demo"
++            )
++            .is_none()
++        );
++        assert!(
++            parse(
++                format!(r#"{{"texture":"demo:car",{base},"wheel_parts":[1,2]}}"#).as_bytes(),
++                "demo"
++            )
++            .is_none()
++        );
++        let many: Vec<String> = (0..17).map(|i| format!("\"p{i}\"")).collect();
++        assert!(
++            parse(
++                format!(
++                    r#"{{"texture":"demo:car",{base},"wheel_parts":[{}]}}"#,
++                    many.join(",")
++                )
++                .as_bytes(),
++                "demo"
++            )
++            .is_none()
++        );
++    }
++    /// A reference to a bone that exists only as a *sibling*, only under a
++    /// hidden branch, or only in another document must not resolve: the check
++    /// is against the names actually collected from this tree.
++    #[test]
++    fn references_are_scoped_to_the_loaded_tree() {
++        let tree = |children: &str| {
++            format!(
++                r#"{{"texture":"demo:car","model":{{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]],"children":{children}}},"wheel_parts":["axle"]}}"#
++            )
++        };
++        // A name present deep in the tree resolves.
++        assert!(
++            parse(
++                tree(r#"{"body":{"children":{"axle":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}}}}"#)
++                    .as_bytes(),
++                "demo"
++            )
++            .is_some()
++        );
++        // A name that is absent is malformed, however close the spelling.
++        assert!(parse(tree(r#"{"body":{"axl":{}}}"#).as_bytes(), "demo").is_none());
++        assert!(parse(tree(r#"{"AXLE":{}}"#).as_bytes(), "demo").is_none());
++        // A duplicated name is still present: duplicates do not mask a hit.
++        let dup = r#"{"body":{"children":{"axle":{}}},"axle":{}}"#;
++        assert!(parse(tree(dup).as_bytes(), "demo").is_some());
++    }
++    /// A list entry longer than the 128-byte name cap, or with a wrong element
++    /// type, is rejected instead of truncated or skipped.
++    #[test]
++    fn oversized_or_mistyped_names_are_rejected() {
++        let base = r#""model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}"#;
++        let long = "a".repeat(129);
++        assert!(
++            parse(
++                format!(r#"{{"texture":"demo:car",{base},"steer_parts":["{long}"]}}"#).as_bytes(),
++                "demo"
++            )
++            .is_none()
++        );
++        assert!(
++            parse(
++                format!(r#"{{"texture":"demo:car",{base},"steer_parts":[null]}}"#).as_bytes(),
++                "demo"
++            )
++            .is_none()
++        );
++    }
++    /// Numeric bounds: `bounds[2]` (length) and `wheel_radius` must be sane.
++    #[test]
++    fn length_and_radius_stay_in_range() {
++        let base = r#""model":{"polygons":[[[0,0,0,0,0],[1,0,0,1,0],[1,1,0,1,1],[0,1,0,0,1]]]}"#;
++        let doc = |extra: &str| format!(r#"{{"texture":"demo:car",{base}{extra}}}"#);
++        assert!(parse(doc(r#","bounds":[0,0,0.05]"#).as_bytes(), "demo").is_none());
++        assert!(parse(doc(r#","bounds":[0,0,17]"#).as_bytes(), "demo").is_none());
++        assert!(parse(doc(r#","wheel_radius":0.0"#).as_bytes(), "demo").is_none());
++        assert!(parse(doc(r#","wheel_radius":3.0"#).as_bytes(), "demo").is_none());
++        let ok = parse(
++            doc(r#","bounds":[0,0,4.5],"wheel_radius":0.4"#).as_bytes(),
++            "demo",
++        )
++        .unwrap();
++        assert_eq!(ok.length, 4.5);
++        assert!((ok.wheel_radius - 0.4).abs() < 1e-6);
++    }
++    /// The node walker refuses bad poses, oversized polygons and deep nesting.
++    #[test]
++    fn node_walk_is_bounded() {
++        let mut budget = 20_000;
++        assert!(!valid_node(&Value::Null, 0, &mut budget));
++        let mut budget = 20_000;
++        assert!(!valid_node(
++            &serde_json::json!({"pose": [0,0,0,0,0,0,1,1,0]}),
++            0,
++            &mut budget
++        ));
++        let mut budget = 20_000;
++        assert!(!valid_node(
++            &serde_json::json!({"polygons": [[[0,0,0,0,0]]]}),
++            0,
++            &mut budget
++        ));
++        let mut budget = 20_000;
++        assert!(!valid_node(
++            &serde_json::json!({"normals": [[0,0,1]]}),
++            0,
++            &mut budget
++        ));
++        let mut budget = 0;
++        assert!(!valid_node(&serde_json::json!({}), 0, &mut budget));
++    }
++    /// Names must be plain lowercase resource paths, at most 128 bytes.
++    #[test]
++    fn ids_are_restricted() {
++        assert!(id_part("car", false));
++        assert!(id_part("entity/vehicle/car", true));
++        assert!(!id_part("entity/vehicle/car", false));
++        assert!(!id_part("", false));
++        assert!(!id_part("Car", false));
++        assert!(!id_part("a/../b", true));
++        assert!(!id_part(&"a".repeat(129), false));
++    }
++}
 diff --git a/crates/horizon-client/src/net.rs b/crates/horizon-client/src/net.rs
 index 93364ed91..88e156e8b 100644
 --- a/crates/horizon-client/src/net.rs
@@ -1497,6 +3224,60 @@ index 93364ed91..88e156e8b 100644
 +        assert!(matches!(events.try_recv(), Ok(Event::ModChannel)));
 +    }
  }
+diff --git a/crates/horizon-client/src/settings.rs b/crates/horizon-client/src/settings.rs
+index eea11d562..3e6f28fb0 100644
+--- a/crates/horizon-client/src/settings.rs
++++ b/crates/horizon-client/src/settings.rs
+@@ -783,6 +783,49 @@ mod tests {
+         assert_eq!(fresh.render_distance, empty.render_distance);
+         assert_eq!(fresh.simulation_distance, empty.simulation_distance);
+     }
++
++    /// The startup boundary: a first run has `horizon-mods.txt` enabling a
++    /// content mod but no `options.txt` yet. `Settings::load` must still read
++    /// the mod list from the game directory, or the content root would be
++    /// built vanilla while the mod's module starts later.
++    #[test]
++    fn load_without_options_txt_still_reads_the_mod_list() {
++        let dir =
++            std::env::temp_dir().join(format!("horizon-settings-nomods-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let _ = std::fs::remove_file(dir.join("options.txt"));
++        std::fs::write(dir.join("horizon-mods.txt"), "mod.superbwarfare:true\n").unwrap();
++
++        let settings = Settings::load(&dir.join("options.txt"));
++        assert!(
++            settings.mods.enabled.contains("superbwarfare"),
++            "a missing options.txt must not drop the enabled mods"
++        );
++        // The typed options still take their defaults, as an empty options.txt.
++        assert_eq!(
++            settings.render_distance,
++            Settings::default().render_distance
++        );
++        assert_eq!(settings.max_fps, Settings::default().max_fps);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// The same boundary with an `options.txt` present, so the mod list is
++    /// read from the file's own directory either way: the two do not diverge
++    /// depending on whether the file exists.
++    #[test]
++    fn load_with_options_txt_reads_the_same_mod_list() {
++        let dir =
++            std::env::temp_dir().join(format!("horizon-settings-mods-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("options.txt"), "fov:70\nrenderDistance:16\n").unwrap();
++        std::fs::write(dir.join("horizon-mods.txt"), "mod.superbwarfare:true\n").unwrap();
++
++        let settings = Settings::load(&dir.join("options.txt"));
++        assert!(settings.mods.enabled.contains("superbwarfare"));
++        assert_eq!(settings.render_distance, 16);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+     #[test]
+     fn subtitle_options() {
+         let s = Settings::parse("showSubtitles:true\nnotificationDisplayTime:2.5\n");
 diff --git a/crates/horizon-mod-sdk/src/lib.rs b/crates/horizon-mod-sdk/src/lib.rs
 index 1e7120091..6175b7eeb 100644
 --- a/crates/horizon-mod-sdk/src/lib.rs
@@ -1527,7 +3308,7 @@ index 1e7120091..6175b7eeb 100644
      pub use horizon::mods::world::{self, BlockChange};
  
 diff --git a/crates/horizon-mod-sdk/wit/horizon.wit b/crates/horizon-mod-sdk/wit/horizon.wit
-index 0680cce92..349224c6e 100644
+index 0680cce92..b52e1fe6c 100644
 --- a/crates/horizon-mod-sdk/wit/horizon.wit
 +++ b/crates/horizon-mod-sdk/wit/horizon.wit
 @@ -245,6 +245,11 @@ interface input {
@@ -1542,7 +3323,7 @@ index 0680cce92..349224c6e 100644
      /// A key of the mod's: `name` comes back in `key-down` and `key-up`,
      /// `label` says what it does, `key` is the key as options.txt writes
      /// it (`key.keyboard.r`), the default: the player can bind another
-@@ -429,6 +434,11 @@ interface render {
+@@ -429,6 +434,22 @@ interface render {
      /// Distance setting, when on, wins. One far terrain shows at a time: the
      /// first loaded mod's.
      set-far-terrain: func(far-terrain: option<far-terrain>);
@@ -1551,10 +3332,21 @@ index 0680cce92..349224c6e 100644
 +    /// this mod's bindings (at most 64). JSON schema: docs/api/gameplay.md.
 +    /// Cosmetic on clients; server physics always uses its own profile.
 +    set-vehicle-models: func(models: list<vehicle-model>);
++    record held-pose {
++        item: string,
++        x: f32, y: f32, z: f32,
++        pitch: f32, yaw: f32, roll: f32,
++    }
++    /// Cosmetic camera-space translation (blocks, at most 2) and rotation
++    /// (degrees, at most 90) for the named main-hand item. None clears it.
++    /// X, yaw and roll mirror for the left main hand. This does not turn
++    /// the player, change aim or authorize damage.
++    set-held-pose: func(pose: option<held-pose>);
++
  }
  
  /// What the game calls. Only the hooks `init` asks for are ever called.
-@@ -783,6 +793,74 @@ interface server-events {
+@@ -783,6 +804,74 @@ interface server-events {
      block-placed: func(player: player, pos: block-pos, state: string);
  }
  
@@ -1629,7 +3421,7 @@ index 0680cce92..349224c6e 100644
  /// A client mod: runs in the player's game.
  world horizon-mod {
      import log;
-@@ -791,6 +869,7 @@ world horizon-mod {
+@@ -791,6 +880,7 @@ world horizon-mod {
      import hud;
      import storage;
      import command;
@@ -1637,7 +3429,7 @@ index 0680cce92..349224c6e 100644
      export events;
  }
  
-@@ -798,10 +877,12 @@ world horizon-mod {
+@@ -798,10 +888,12 @@ world horizon-mod {
  /// runs where the world is simulated, on the dedicated server, a LAN host
  /// and single player's own server.
  world horizon-server-mod {
@@ -1682,7 +3474,7 @@ index 8bfa58bcd..05db437a4 100644
  [lints]
  workspace = true
 diff --git a/crates/horizon-mods/src/api_level.rs b/crates/horizon-mods/src/api_level.rs
-index 045a9346b..508e11d29 100644
+index 045a9346b..c831d6889 100644
 --- a/crates/horizon-mods/src/api_level.rs
 +++ b/crates/horizon-mods/src/api_level.rs
 @@ -7,13 +7,13 @@
@@ -1690,24 +3482,25 @@ index 045a9346b..508e11d29 100644
  
  /// The newest level this Horizon serves.
 -pub const LEVEL: u32 = 7;
-+pub const LEVEL: u32 = 9;
++pub const LEVEL: u32 = 10;
  
  /// Every function the game offers mods, as `interface.function`, with its
  /// level. Level 0 is the contract of Horizon 0.2.67 to 0.2.69. A new
  /// function takes the next level and raises [`LEVEL`] (the `api_reference`
  /// test fails until it is listed here).
 -pub const FUNCTIONS: [(&str, u32); 46] = [
-+pub const FUNCTIONS: [(&str, u32); 56] = [
++pub const FUNCTIONS: [(&str, u32); 57] = [
      ("log.write", 0),
      ("game.get-player", 0),
      ("game.get-clock", 0),
-@@ -60,6 +60,16 @@ pub const FUNCTIONS: [(&str, u32); 46] = [
+@@ -60,6 +60,17 @@ pub const FUNCTIONS: [(&str, u32); 46] = [
      ("recipes.place", 6),
      ("recipes.give", 6),
      ("render.set-far-terrain", 7),
 +    ("input.claim-attack", 9),
 +    ("input.poll-attack", 9),
 +    ("render.set-vehicle-models", 9),
++    ("render.set-held-pose", 10),
 +    ("gameplay.inventories", 9),
 +    ("gameplay.vehicles", 9),
 +    ("gameplay.commit", 9),
@@ -1817,7 +3610,7 @@ index c2f2f61fc..568487a2b 100644
              return Err(format!("{MANIFEST}: capability {c} is for {side} mods"));
          }
 diff --git a/crates/horizon-mods/src/runtime.rs b/crates/horizon-mods/src/runtime.rs
-index cff44722b..1dd60ba8e 100644
+index cff44722b..4726add40 100644
 --- a/crates/horizon-mods/src/runtime.rs
 +++ b/crates/horizon-mods/src/runtime.rs
 @@ -3,7 +3,7 @@ use crate::manifest::{Manifest, Package, Side};
@@ -1861,7 +3654,7 @@ index cff44722b..1dd60ba8e 100644
  pub use server_bindings::{
      exports::horizon::mods::server_events::{
          Argument, ArgumentKind, ArgumentValue, BlockPos, ServerCommand,
-@@ -75,7 +86,9 @@ mod render_bindings {
+@@ -75,10 +86,12 @@ mod render_bindings {
  }
  use render_bindings::horizon::mods::input;
  /// Capability `input`'s records (WIT `interface input`).
@@ -1871,7 +3664,11 @@ index cff44722b..1dd60ba8e 100644
 +};
  /// What capability `render` asks the game to draw (WIT `interface render`).
  pub use render_bindings::horizon::mods::render::{
-     Corner as RenderCorner, FarTerrain as ModFarTerrain, FillShape, FrameRate, ItemShape,
+-    Corner as RenderCorner, FarTerrain as ModFarTerrain, FillShape, FrameRate, ItemShape,
++    Corner as RenderCorner, FarTerrain as ModFarTerrain, FillShape, FrameRate, HeldPose, ItemShape,
+     Minimap as ModMinimap, Point as RenderPoint, QuadShape, Rect as RenderRect, Shape, SpriteShape,
+     TextShape, Zoom as ModZoom,
+ };
 @@ -136,6 +149,10 @@ const STORAGE_WRITE_BUDGET: u64 = 1 << 20;
  /// What mods may read of the game, copied once per tick by the game.
  #[derive(Clone, Debug, Default)]
@@ -1915,7 +3712,15 @@ index cff44722b..1dd60ba8e 100644
      name: String,
      id: String,
      snapshot: Arc<Snapshot>,
-@@ -538,6 +573,8 @@ impl Mods {
+@@ -412,6 +447,7 @@ struct State {
+     corner: Option<CornerPanel>,
+     /// Capability `render`'s zoom, when the mod zooms.
+     zoom: Option<ModZoom>,
++    held_pose: Option<HeldPose>,
+     /// Capability `render`'s minimap, when the mod shows one.
+     minimap: Option<ModMinimap>,
+     /// Capability `render`'s far terrain, when the mod draws one.
+@@ -538,6 +574,8 @@ impl Mods {
              let mut linker = Linker::new(&engine);
              HorizonMod::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
                  .map_err(|e| e.to_string())?;
@@ -1924,7 +3729,7 @@ index cff44722b..1dd60ba8e 100644
              players::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
                  .map_err(|e| e.to_string())?;
              mod_world::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
-@@ -567,13 +604,14 @@ impl Mods {
+@@ -567,13 +605,14 @@ impl Mods {
          let Some(wasm) = &package.wasm else {
              return Ok(None);
          };
@@ -1946,7 +3751,7 @@ index cff44722b..1dd60ba8e 100644
              return Err(format!("another running mod already uses id {}", m.id));
          }
          let server = m.side == Side::Server;
-@@ -608,6 +646,7 @@ impl Mods {
+@@ -608,6 +647,7 @@ impl Mods {
              .join(crate::manifest::STORAGE_DIR)
              .join(&m.id);
          let state = State {
@@ -1954,7 +3759,15 @@ index cff44722b..1dd60ba8e 100644
              name: m.name.clone(),
              id: m.id.clone(),
              snapshot,
-@@ -766,6 +805,7 @@ impl Mods {
+@@ -617,6 +657,7 @@ impl Mods {
+             shapes: Vec::new(),
+             corner: None,
+             zoom: None,
++            held_pose: None,
+             minimap: None,
+             far_terrain: None,
+             input: InputState::default(),
+@@ -766,6 +807,7 @@ impl Mods {
          let run = entry.run.as_mut()?;
          run.store.data_mut().snapshot = self.snapshot.clone();
          run.store.data_mut().storage_budget = STORAGE_WRITE_BUDGET;
@@ -1962,7 +3775,7 @@ index cff44722b..1dd60ba8e 100644
          let started = Instant::now();
          let result = run.store.set_fuel(fuel).and_then(|()| f(run));
          // An average over about the last 64 calls.
-@@ -775,6 +815,15 @@ impl Mods {
+@@ -775,6 +817,15 @@ impl Mods {
              std::mem::take(&mut data.ui.open),
              std::mem::take(&mut data.ui.close),
          );
@@ -1978,7 +3791,7 @@ index cff44722b..1dd60ba8e 100644
          self.out.append(&mut data.out);
          if open {
              self.out.push(Output::OpenScreen { owner: i });
-@@ -869,6 +918,7 @@ impl Mods {
+@@ -869,6 +920,7 @@ impl Mods {
      }
      /// `player` left the server (they are no longer in the snapshot's players).
      pub fn player_left(&mut self, player: &ServerPlayer) {
@@ -1986,7 +3799,7 @@ index cff44722b..1dd60ba8e 100644
          self.each_server(
              FUEL_EVENT,
              |h| h.joins,
-@@ -1035,6 +1085,38 @@ impl Mods {
+@@ -1035,6 +1087,38 @@ impl Mods {
      pub fn claims(&self, id: &str) -> bool {
          self.inputs().any(|i| i.claimed.iter().any(|c| c == id))
      }
@@ -2025,7 +3838,21 @@ index cff44722b..1dd60ba8e 100644
      /// Some running mod registered a key.
      pub fn has_keys(&self) -> bool {
          self.inputs().any(|i| !i.keys.is_empty())
-@@ -1627,6 +1709,8 @@ pub struct ModKey {
+@@ -1167,6 +1251,13 @@ impl Mods {
+             .filter_map(|e| e.run.as_ref()?.store.data().zoom)
+             .max_by(|a, b| a.factor.total_cmp(&b.factor))
+     }
++    /// Cosmetic first-person pose for this item, from the first requesting mod.
++    pub fn held_pose(&self, item: &str) -> Option<&HeldPose> {
++        self.entries
++            .iter()
++            .filter_map(|e| e.run.as_ref()?.store.data().held_pose.as_ref())
++            .find(|p| p.item == item)
++    }
+     /// The minimap the first running mod shows (capability `render`).
+     pub fn minimap(&self) -> Option<ModMinimap> {
+         self.entries
+@@ -1627,6 +1718,8 @@ pub struct ModKey {
  #[derive(Default)]
  struct InputState {
      claimed: Vec<String>,
@@ -2034,7 +3861,7 @@ index cff44722b..1dd60ba8e 100644
      keys: Vec<ModKey>,
      events: std::collections::VecDeque<InputEvent>,
      /// The mod's keys held now, by name.
-@@ -1676,6 +1760,12 @@ impl InputState {
+@@ -1676,6 +1769,12 @@ impl InputState {
  }
  
  impl input::Host for State {
@@ -2047,10 +3874,29 @@ index cff44722b..1dd60ba8e 100644
      fn claim_items(&mut self, ids: Vec<String>) {
          self.input.claimed = ids.into_iter().take(CLAIMS).map(clip).collect();
      }
-@@ -1774,6 +1864,9 @@ fn clip_shapes(shapes: Vec<Shape>) -> Vec<Shape> {
+@@ -1774,6 +1873,28 @@ fn clip_shapes(shapes: Vec<Shape>) -> Vec<Shape> {
  }
  
  impl render::Host for State {
++    fn set_held_pose(&mut self, pose: Option<HeldPose>) {
++        self.held_pose = pose
++            .filter(|p| {
++                p.item.len() <= 128
++                    && [p.x, p.y, p.z, p.pitch, p.yaw, p.roll]
++                        .iter()
++                        .all(|n| n.is_finite())
++            })
++            .map(|p| HeldPose {
++                x: p.x.clamp(-2., 2.),
++                y: p.y.clamp(-2., 2.),
++                z: p.z.clamp(-2., 2.),
++                pitch: p.pitch.clamp(-90., 90.),
++                yaw: p.yaw.clamp(-90., 90.),
++                roll: p.roll.clamp(-90., 90.),
++                ..p
++            });
++    }
++
 +    fn set_vehicle_models(&mut self, models: Vec<render::VehicleModel>) {
 +        self.vehicle_models(models);
 +    }
@@ -2880,7 +4726,7 @@ index 000000000..b15dacd5d
 +    );
 +}
 diff --git a/crates/horizon-mods/tests/sandbox.rs b/crates/horizon-mods/tests/sandbox.rs
-index e400dd56b..e1957f4d7 100644
+index e400dd56b..535efd2d3 100644
 --- a/crates/horizon-mods/tests/sandbox.rs
 +++ b/crates/horizon-mods/tests/sandbox.rs
 @@ -205,7 +205,7 @@ fn undeclared_capabilities_are_refused() {
@@ -2912,7 +4758,7 @@ index e400dd56b..e1957f4d7 100644
 +    // The UI guest claims attack input and polls its separate events.
 +    assert_eq!(
 +        level("horizon_mods_test_ui_guest.hmod"),
-+        level_of("input.poll-attack").unwrap()
++        level_of("render.set-held-pose").unwrap()
 +    );
  }
  
@@ -2960,11 +4806,50 @@ index e400dd56b..e1957f4d7 100644
  #[test]
  fn the_players_key_choice_wins() {
      let chat = |mods: &mut Mods| -> Vec<String> {
+@@ -1302,3 +1341,14 @@ fn browser_lists_items_and_hears_the_player() {
+     }
+     assert_eq!(said(&mut mods, "browser_poll")[0], "256 events");
+ }
++
++#[test]
++fn held_pose_is_item_scoped_and_bounded() {
++    let mut mods = load("horizon_mods_test_ui_guest.hmod");
++    assert!(mods.command("render_held"));
++    let p = mods.held_pose("minecraft:stick").unwrap();
++    assert_eq!((p.x, p.y, p.pitch), (2., -2., 90.));
++    assert!(mods.held_pose("minecraft:diamond").is_none());
++    assert!(mods.command("render_held bad"));
++    assert!(mods.held_pose("minecraft:stick").is_none());
++}
 diff --git a/crates/horizon-mods/tests/ui_guest/src/lib.rs b/crates/horizon-mods/tests/ui_guest/src/lib.rs
-index f95aedffa..5531ddcca 100644
+index f95aedffa..86928588f 100644
 --- a/crates/horizon-mods/tests/ui_guest/src/lib.rs
 +++ b/crates/horizon-mods/tests/ui_guest/src/lib.rs
-@@ -185,12 +185,23 @@ impl Mod for Guest {
+@@ -104,6 +104,7 @@ impl Mod for Guest {
+             "ui_settings",
+             "ui_close",
+             "render_hud",
++            "render_held",
+             "render_clear",
+             "render_shake",
+             "input_claim",
+@@ -139,6 +140,15 @@ impl Mod for Guest {
+             "ui_settings" => ui::set_settings(&widgets()),
+             "ui_close" => ui::close_screen(),
+             "render_hud" => render::set_hud(&shapes()),
++            "render_held" => render::set_held_pose(Some(&render::HeldPose {
++                item: "minecraft:stick".into(),
++                x: if args == "bad" { f32::NAN } else { 20. },
++                y: -20.,
++                z: 0.,
++                pitch: 100.,
++                yaw: 0.,
++                roll: 0.,
++            })),
+             "render_clear" => render::set_hud(&[]),
+             // An FPS-counter-like box: as wide as its text plus 4.
+             "corner" => {
+@@ -185,12 +195,23 @@ impl Mod for Guest {
              }
              "input_claim" => {
                  input::claim_items(&["minecraft:stick".into()]);
@@ -3092,10 +4977,10 @@ index 000000000..10c9ee799
 +}
 diff --git a/docs/api/gameplay.md b/docs/api/gameplay.md
 new file mode 100644
-index 000000000..2e8473155
+index 000000000..27f3fbc47
 --- /dev/null
 +++ b/docs/api/gameplay.md
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,85 @@
 +# Experimental mod gameplay (API level 9)
 +
 +Server mods opt into `gameplay` on API 0.3. `inventories()` exposes native slots,
@@ -3116,8 +5001,12 @@ index 000000000..2e8473155
 +PvP rules and entity tracking apply. These are arrow ballistics and presentation,
 +not a custom bullet renderer or an armor penetration system.
 +
-+A vehicle edit consumes the held item and places a native passenger entity at the
-+player's placement ray. Its `vehicle` string is a JSON ground chassis profile:
++A vehicle edit consumes the held item and places a native passenger entity on the
++player's authoritative collision ray. The ray must hit an upward solid surface;
++the clicked point anchors the back of the chassis, with a 0.4 block gap. The host
++checks loaded ground at the centre and inset rotated corners, rejects support
++height differences over 0.6 blocks, and checks the entire chassis for obstruction
++before consuming anything. Its `vehicle` string is a JSON ground chassis profile:
 +
 +```json
 +{
@@ -3130,7 +5019,7 @@ index 000000000..2e8473155
 +```
 +
 +Distances and velocity are blocks and blocks/tick; acceleration is per tick, drag
-+is a multiplier, steering is degrees/tick. Bounds: width 0.5–6, length 0.5–8,
++is a multiplier, steering is degrees/tick. Bounds: width 0.5–6, length 0.5–12,
 +height 0.3–5, acceleration 0.001–0.2, drag 0.5–0.999, speed 0.01–2,
 +turn 0.1–10, health 1–10000; 1–64 cuboids with finite coordinates within ±8.
 +`seat_z` optionally moves the seat along the local chassis (default 0, within half
@@ -3138,7 +5027,9 @@ index 000000000..2e8473155
 +
 +The chassis has gravity, swept block and vehicle collision, a 0.6 block step,
 +one player seat, native mount/dismount and native chunk persistence. It does not
-+float, fly, burn fuel or simulate wheels/suspension. The server drives it from the
++float, fly, burn fuel or simulate suspension. Steering follows signed travel,
++opposite throttle brakes before reversing, and tyre grip damps lateral slide.
++The server drives it from the
 +authenticated passenger's vanilla input flags. Client vehicle position packets
 +cannot move it. Without input it coasts to a stop. Profiles, owner and health save
 +under `HorizonModVehicle` in the native entity's NBT. Native tracking uses the boat
@@ -3148,16 +5039,35 @@ index 000000000..2e8473155
 +Mods transport profiles over their own authenticated `net` channel. Client
 +`render.set-vehicle-models` binds profiles to native entity ids for rendering and
 +passenger prediction; it cannot override a server's authoritative profile. Bindings
-+are full replacements, at most 64, and draw simple shaded cuboids. Client models
-+are cosmetic. No mod-specific tuning or weapon rules live in the engine.
++are full replacements, at most 64. A client predicts the same chassis motion and
++blends small server corrections; the server remains authoritative.
++
++Clients may supply a textured native `Part` tree at
++`assets/<namespace>/models/entity/<definition-path>.json`. The document has a
++`model` tree, an owned `texture` resource id, optional `wheel_parts` and
++`steer_parts` name arrays, `wheel_radius` in blocks, and `bounds: [width,height,length]`.
++Wheel parts roll with signed travel and steer parts follow input. Textures belong
++under the existing atlas folders, such as `textures/entity/vehicle/`; foreign
++textures retain their namespace. Invalid or missing models/textures draw the
++profile's shaded cuboids. Documents are limited to 8 MiB, depth 64 and 20,000
++nodes/quads; all pose, vertex and normal values must be finite and bounded.
++Models are cosmetic. No mod-specific tuning or weapon rules live in the engine.
 +
 +`input.claim-attack` takes attack clicks for the listed items, emitting
 +start/stop transitions via `input.poll-attack` and suppressing mining and melee. Screen changes or
 +changing the selected item release a held claim. Existing `claim-items` continues
 +to claim the use button separately. Server mods must still validate the selected
 +item and impose a short trigger lease; input events grant no damage authority.
++
++API level 10 adds `render.set-held-pose(option<held-pose>)` for cosmetic main-hand
++animation. A pose names the calling mod's item, translates it in camera-space
++blocks, and rotates it in degrees before the normal item transform. Translation
++is clamped to ±2 blocks and pitch/yaw/roll to ±90 degrees; nonfinite inputs clear
++the pose. X, yaw and roll mirror for a left main hand. The pose applies only while
++playing and holding the named item. Set `none` to clear it; stopping the module
++also clears it. This does not change projectile direction or the server's view.
 diff --git a/docs/api/mods-reference.md b/docs/api/mods-reference.md
-index b25ef5b9e..48ea94c43 100644
+index b25ef5b9e..a05057055 100644
 --- a/docs/api/mods-reference.md
 +++ b/docs/api/mods-reference.md
 @@ -19,26 +19,28 @@ The contract between Horizon and its mods: the WIT package `horizon:mods@0.1.0`,
@@ -3215,7 +5125,7 @@ index b25ef5b9e..48ea94c43 100644
  | `register-key` | `func(name: string, label: string, key: string) -> result<_, string>` | A key of the mod's: `name` comes back in `key-down` and `key-up`, `label` says what it does, `key` is the key as options.txt writes it (`key.keyboard.r`), the default: the player can bind another one on the mod's page in Options > Mods, and that one wins. At most 16; an unknown key is an error. |
  | `held` | `func() -> option<held-item>` | The main hand's stack, as of this tick; none when it is empty. |
  | `poll` | `func() -> list<event>` | The events since the last call, oldest first. |
-@@ -442,6 +453,13 @@ Any four-cornered shape (a wheel's segment, an arrow): the corners in order roun
+@@ -442,6 +453,25 @@ Any four-cornered shape (a wheel's segment, an arrow): the corners in order roun
  | `distance` | `u32` | How far the distant terrain reaches, in chunks: 64 to 1024. On integrated graphics other than Apple's the game caps it lower. |
  | `reduced` | `bool` | Coarser far tiles, as the Far Detail setting's Reduced: 2 to 4 ms less GPU time per frame on integrated graphics. |
  
@@ -3226,18 +5136,31 @@ index b25ef5b9e..48ea94c43 100644
 +| `entity` | `u32` |  |
 +| `profile` | `string` |  |
 +
++### record `held-pose`
++
++| Field | Type | |
++| --- | --- | --- |
++| `item` | `string` |  |
++| `x` | `f32` |  |
++| `y` | `f32` |  |
++| `z` | `f32` |  |
++| `pitch` | `f32` |  |
++| `yaw` | `f32` |  |
++| `roll` | `f32` |  |
++
  | Function | Signature | What it does |
  | --- | --- | --- |
  | `set-hud` | `func(shapes: list<shape>)` | Replaces the mod's HUD shapes: up to 1024, drawn every frame in order over the HUD (after the hotbar, under chat and screens), hidden with the HUD (F1). An empty list removes them. |
-@@ -454,6 +472,7 @@ Any four-cornered shape (a wheel's segment, an arrow): the corners in order roun
+@@ -454,6 +484,8 @@ Any four-cornered shape (a wheel's segment, an arrow): the corners in order roun
  | `set-zoom` | `func(zoom: zoom)` | Zooms the camera until the next call (`factor` 1 ends it), only while playing: a screen opening or the spyglass's own view (which wins) leave the camera vanilla's. With several mods, the strongest zoom counts. |
  | `set-minimap` | `func(minimap: option<minimap>)` | Shows a map of the world around the player in `corner`, stacked with the game's overlays and the mods' panels, until the next call (none hides it). It looks like a map item: vanilla's map colours with their height shading and water depth, and the player's arrow. Underground, under a roof and in the Nether it maps the floor around the player's height. The game keeps the map's tiles and refreshes them within its own frame budget; hidden, they are dropped. One map shows at a time: the first loaded mod's. |
  | `set-far-terrain` | `func(far-terrain: option<far-terrain>)` | Draws the world beyond the render distance as distant terrain, out to `distance` chunks, until the next call (none ends it). The game builds it on its own workers, from the chunks already loaded or saved and, where nobody has been, from the world's generator; the simulation distance doesn't change. Only worlds whose generator the game has (single player and a LAN world you host) show it. The player's own LOD Distance setting, when on, wins. One far terrain shows at a time: the first loaded mod's. |
 +| `set-vehicle-models` | `func(models: list<vehicle-model>)` | Bind generic cuboid vehicle profiles to native entity ids. Replaces this mod's bindings (at most 64). JSON schema: docs/api/gameplay.md. Cosmetic on clients; server physics always uses its own profile. |
++| `set-held-pose` | `func(pose: option<held-pose>)` | Cosmetic camera-space translation (blocks, at most 2) and rotation (degrees, at most 90) for the named main-hand item. None clears it. X, yaw and roll mirror for the left main hand. This does not turn the player, change aim or authorize damage. |
  
  ## `events`
  
-@@ -768,3 +787,107 @@ An argument's value, parsed as its kind says.
+@@ -768,3 +800,107 @@ An argument's value, parsed as its kind says.
  | `command` | `func(player: player, name: string, args: string, values: list<tuple<string, argument-value>>) -> result<option<string>, string>` | `/name args` typed by `player`: ok(some(text)) is their feedback, err(text) their error in red. `values` holds each argument given, by name, in order (an optional one left out isn't there); a line that doesn't parse never reaches the mod: the player gets vanilla's error. |
  | `block-broken` | `func(player: player, pos: block-pos, state: string)` | A player broke the block at `pos` in their dimension: `state` is what was there, as `minecraft:oak_log[axis=y]`. |
  | `block-placed` | `func(player: player, pos: block-pos, state: string)` | A player placed `state` at `pos` in their dimension. |
@@ -3359,7 +5282,7 @@ index 0dc74e7a3..a43b11cb1 100644
  - **Keys and the crosshair target**: keybinds in Controls; what the player is looking at.
  - **Script mods and other languages**: see [Ways in](#ways-in).
 diff --git a/docs/api/stability.md b/docs/api/stability.md
-index 765034b3d..57df4e6f9 100644
+index 765034b3d..7e2b0ab96 100644
 --- a/docs/api/stability.md
 +++ b/docs/api/stability.md
 @@ -38,7 +38,7 @@ don't import it); faster, or fixing behaviour to what the reference already says
@@ -3367,7 +5290,7 @@ index 765034b3d..57df4e6f9 100644
  A new WIT function doesn't break older mods, but a mod that calls it can't run on a Horizon from before it. So every
  function the game offers mods has an **API level**, the one it arrived at (`crates/horizon-mods/src/api_level.rs`):
 -level 0 is the contract of Horizon 0.2.67 to 0.2.69, level 1 adds `render.set-minimap` and server mods' `players`, level 2 `game.raycast`, level 3 `command.run-quiet`, level 4 server mods' `world`, level 5 `recipes` (`items`, `all`, `known`), level 6 `browser` (`set-items`, `poll`, `set-recipes`) and `recipes.place` and `recipes.give`, level 7 `render.set-far-terrain`. A mod needs the level of
-+level 0 is the contract of Horizon 0.2.67 to 0.2.69, level 1 adds `render.set-minimap` and server mods' `players`, level 2 `game.raycast`, level 3 `command.run-quiet`, level 4 server mods' `world`, level 5 `recipes` (`items`, `all`, `known`), level 6 `browser` (`set-items`, `poll`, `set-recipes`) and `recipes.place` and `recipes.give`, level 7 `render.set-far-terrain`, level 8 the experimental `net` channel, and level 9 `gameplay`, `input.claim-attack`/`poll-attack` and `render.set-vehicle-models`. A mod needs the level of
++level 0 is the contract of Horizon 0.2.67 to 0.2.69, level 1 adds `render.set-minimap` and server mods' `players`, level 2 `game.raycast`, level 3 `command.run-quiet`, level 4 server mods' `world`, level 5 `recipes` (`items`, `all`, `known`), level 6 `browser` (`set-items`, `poll`, `set-recipes`) and `recipes.place` and `recipes.give`, level 7 `render.set-far-terrain`, level 8 the experimental `net` channel, level 9 `gameplay`, `input.claim-attack`/`poll-attack` and `render.set-vehicle-models`, and level 10 `render.set-held-pose`. A mod needs the level of
  the newest function it imports (a component imports only the functions it calls). The level is read from the file,
  never declared:
  

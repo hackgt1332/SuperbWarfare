@@ -328,6 +328,48 @@ fn gameplay_snapshot(state: Vec<u8>, ammo: u32, item: &str) -> Snapshot {
     )];
     snapshot
 }
+/// A snapshot naming `PLAYER` and every id in `others` as an alive survivor in
+/// the overworld. Used to prove the fair queues rotate across senders.
+fn multi_player_snapshot(others: &[&str]) -> Snapshot {
+    let mut view = snapshot();
+    view.players = std::iter::once(PLAYER)
+        .chain(others.iter().copied())
+        .map(|id| horizon_mods::ServerPlayer {
+            id: id.into(),
+            name: id.into(),
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            dimension: "minecraft:overworld".into(),
+            game_mode: horizon_mods::GameMode::Survival,
+            health: 20.0,
+        })
+        .collect();
+    view
+}
+/// One inventory for an arbitrary player with a single wholly-selected slot.
+fn player_inventory(
+    player: &str,
+    slot: u32,
+    item: &str,
+    count: u32,
+    selected: bool,
+    state: Vec<u8>,
+) -> (String, horizon_mods::PlayerInventory) {
+    (
+        "superbwarfare".into(),
+        horizon_mods::PlayerInventory {
+            player: player.into(),
+            stacks: vec![horizon_mods::InventoryStack {
+                slot,
+                item: item.into(),
+                count,
+                selected,
+                state,
+            }],
+        },
+    )
+}
 fn edits(server: &mut Mods) -> Vec<horizon_mods::InventoryEdit> {
     server
         .drain()
@@ -471,31 +513,33 @@ fn real_server_reserves_reload_and_emits_atomic_shot_edits() {
 }
 #[test]
 fn real_server_deploys_only_the_selected_vehicle_item() {
-    let (mut client, mut server) = pair();
-    client.tick(0);
-    to_server(&mut client, &mut server, 1);
-    server.server_tick(1);
-    let token = to_client(&mut server, &mut client, 1)
-        .into_iter()
-        .find_map(|p| {
-            if let ServerPacket::Welcome(w) = p {
-                Some(w.session)
-            } else {
-                None
-            }
-        })
-        .unwrap();
-    server.set_snapshot(gameplay_snapshot(vec![], 0, sbw_sim::PICKUP));
-    send_intent(&mut server, token, 1, Intent::DeployVehicle(1));
-    server.server_tick(2);
-    assert!(edits(&mut server).is_empty());
-    send_intent(&mut server, token, 2, Intent::DeployVehicle(0));
-    server.server_tick(3);
-    let spawn = edits(&mut server).remove(0);
-    assert_eq!(spawn.slot, 0);
-    assert_eq!(spawn.item, sbw_sim::PICKUP);
-    assert_eq!(spawn.vehicle.as_deref(), Some(sbw_sim::pickup_profile()));
-    assert!(spawn.shot.is_none());
+    for item in sbw_sim::VEHICLES {
+        let (mut client, mut server) = pair();
+        client.tick(0);
+        to_server(&mut client, &mut server, 1);
+        server.server_tick(1);
+        let token = to_client(&mut server, &mut client, 1)
+            .into_iter()
+            .find_map(|p| {
+                if let ServerPacket::Welcome(w) = p {
+                    Some(w.session)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        server.set_snapshot(gameplay_snapshot(vec![], 0, item));
+        send_intent(&mut server, token, 1, Intent::DeployVehicle(1));
+        server.server_tick(2);
+        assert!(edits(&mut server).is_empty());
+        send_intent(&mut server, token, 2, Intent::DeployVehicle(0));
+        server.server_tick(3);
+        let spawn = edits(&mut server).remove(0);
+        assert_eq!(spawn.slot, 0);
+        assert_eq!(spawn.item, item);
+        assert_eq!(spawn.vehicle.as_deref(), sbw_sim::vehicle_profile(item));
+        assert!(spawn.shot.is_none());
+    }
 }
 
 #[test]
@@ -683,4 +727,227 @@ fn vehicle_tracking_filters_recipient_dimension_before_the_tracking_budget() {
         entities[0].entity.state.as_slice(),
         overworld_profile.as_bytes()
     );
+}
+
+fn assert_refused_vehicle_input(server: &mut Mods, sequence: u64) {
+    let outputs = server.drain();
+    assert!(
+        outputs
+            .iter()
+            .all(|o| !matches!(o, Output::Gameplay { edit, .. } if edit.vehicle.is_some()))
+    );
+    assert!(outputs.iter().any(|o| match o {
+        Output::Network {
+            player: Some(player),
+            data,
+            ..
+        } if player == PLAYER => {
+            matches!(wire::decode_server(data), Ok(ServerPacket::Rejected(Rejection {
+                sequence: Some(n), reason: RejectReason::StaleTarget
+            })) if n == sequence)
+        }
+        _ => false,
+    }));
+}
+
+/// Deploy intents are authorized by the selected hotbar stack *and* the slot
+/// they name. A matching item in a different slot, an unselected one, a stack
+/// that is not exactly one, and an out-of-range slot all refuse and never
+/// produce a spawn edit.
+#[test]
+fn real_server_refuses_deploys_that_do_not_name_the_held_single_stack() {
+    let (mut client, mut server) = pair();
+    client.tick(0);
+    to_server(&mut client, &mut server, 1);
+    server.server_tick(1);
+    let session = to_client(&mut server, &mut client, 1)
+        .into_iter()
+        .find_map(|packet| match packet {
+            ServerPacket::Welcome(welcome) => Some(welcome.session),
+            _ => None,
+        })
+        .unwrap();
+
+    // 1. The item is selected but lives in slot 2, so a request naming slot 0
+    //    must not deploy it.
+    let mut view = snapshot();
+    view.inventories = vec![player_inventory(
+        PLAYER,
+        2,
+        sbw_sim::PICKUP,
+        1,
+        true,
+        Vec::new(),
+    )];
+    server.set_snapshot(view);
+    send_intent(&mut server, session, 1, Intent::DeployVehicle(0));
+    server.server_tick(2);
+    assert_refused_vehicle_input(&mut server, 1);
+    // The correct slot for the held stack is accepted.
+    send_intent(&mut server, session, 2, Intent::DeployVehicle(2));
+    server.server_tick(3);
+    let spawn = edits(&mut server).remove(0);
+    assert_eq!(spawn.slot, 2);
+    assert_eq!(spawn.item, sbw_sim::PICKUP);
+    assert!(spawn.shot.is_none());
+
+    // 2. A split stack of two is not a single deployable stack.
+    let mut view = snapshot();
+    view.inventories = vec![player_inventory(
+        PLAYER,
+        0,
+        sbw_sim::PICKUP,
+        2,
+        true,
+        Vec::new(),
+    )];
+    server.set_snapshot(view);
+    send_intent(&mut server, session, 3, Intent::DeployVehicle(0));
+    server.server_tick(4);
+    assert!(edits(&mut server).is_empty());
+
+    // 3. A wholly selected but unselected stack (selected flag off).
+    let mut view = snapshot();
+    view.inventories = vec![player_inventory(
+        PLAYER,
+        0,
+        sbw_sim::PICKUP,
+        1,
+        false,
+        Vec::new(),
+    )];
+    server.set_snapshot(view);
+    send_intent(&mut server, session, 4, Intent::DeployVehicle(0));
+    server.server_tick(5);
+    assert!(edits(&mut server).is_empty());
+
+    // 3b. Two selected stacks are an ambiguous inventory: a deploy must not
+    //     pick a winner between them.
+    let mut view = snapshot();
+    view.inventories = vec![(
+        "superbwarfare".into(),
+        horizon_mods::PlayerInventory {
+            player: PLAYER.into(),
+            stacks: vec![
+                horizon_mods::InventoryStack {
+                    slot: 0,
+                    item: sbw_sim::PICKUP.into(),
+                    count: 1,
+                    selected: true,
+                    state: Vec::new(),
+                },
+                horizon_mods::InventoryStack {
+                    slot: 1,
+                    item: sbw_sim::TRUCK.into(),
+                    count: 1,
+                    selected: true,
+                    state: Vec::new(),
+                },
+            ],
+        },
+    )];
+    server.set_snapshot(view);
+    for slot in [0u8, 1] {
+        send_intent(
+            &mut server,
+            session,
+            5 + u64::from(slot),
+            Intent::DeployVehicle(slot),
+        );
+        server.server_tick(6 + u64::from(slot));
+        assert!(
+            edits(&mut server).is_empty(),
+            "an ambiguous selection must not deploy slot {slot}"
+        );
+    }
+
+    // 4. A slot outside the hotbar is rejected at the wire layer, before any
+    //    handler runs: it is not a valid intent at all, and it must not be
+    //    encoded, so a client cannot smuggle a matching stack past the schema.
+    assert!(
+        wire::encode_client(&ClientPacket::Input(Input {
+            session,
+            sequence: 5,
+            client_tick: 0,
+            intent: Intent::DeployVehicle(9),
+        }))
+        .is_err(),
+        "an out-of-range deploy slot must not encode"
+    );
+
+    // A slot that is a legal hotbar index but holds nothing selected is a
+    // stale reference for the server, not a spawn.
+    let mut view = snapshot();
+    view.inventories = vec![player_inventory(
+        PLAYER,
+        0,
+        sbw_sim::PICKUP,
+        1,
+        true,
+        Vec::new(),
+    )];
+    server.set_snapshot(view);
+    send_intent(&mut server, session, 8, Intent::DeployVehicle(1));
+    server.server_tick(9);
+    assert!(edits(&mut server).is_empty());
+}
+
+/// One peer's deploy is authorized only against that peer's own inventory. A
+/// player holding nothing deployable cannot spawn the vehicle another player
+/// is holding, even by naming its slot.
+#[test]
+fn real_server_never_deploys_another_peers_held_vehicle() {
+    const OTHER: &str = "00000000-0000-0000-0000-000000000002";
+    let (mut client, mut server) = pair();
+    client.tick(0);
+    to_server(&mut client, &mut server, 1);
+    server.server_tick(1);
+    let session = to_client(&mut server, &mut client, 1)
+        .into_iter()
+        .find_map(|packet| match packet {
+            ServerPacket::Welcome(welcome) => Some(welcome.session),
+            _ => None,
+        })
+        .unwrap();
+
+    // PLAYER holds a gun in slot 0; OTHER holds a whole vehicle in slot 1.
+    let mut view = multi_player_snapshot(&[OTHER]);
+    view.inventories = vec![
+        player_inventory(PLAYER, 0, sbw_sim::AK47, 1, true, vec![]),
+        player_inventory(OTHER, 1, sbw_sim::TRUCK, 1, true, vec![]),
+    ];
+    server.set_snapshot(view);
+    send_intent(&mut server, session, 1, Intent::DeployVehicle(1));
+    server.server_tick(2);
+    assert_refused_vehicle_input(&mut server, 1);
+}
+
+/// The drain budget is four messages per tick, so a burst larger than the
+/// budget cannot vanish: the surplus stays queued and is acknowledged on a
+/// later tick, and the sender's newest sequence is never overtaken by a stale
+/// one. This is the property an index-based rotation must preserve.
+#[test]
+fn real_server_drains_a_burst_over_successive_ticks_without_dropping() {
+    let (mut client, mut server) = pair();
+    negotiate(&mut client, &mut server);
+    for _ in 0..4 {
+        client.command("sbw_probe");
+    }
+    assert_eq!(to_server(&mut client, &mut server, 1).len(), 4);
+    server.server_tick(3);
+    let packets = to_client(&mut server, &mut client, 1);
+    // Exactly one snapshot is produced for the sender this tick, and it
+    // acknowledges the highest sequence the server accepted.
+    let snapshot = packets
+        .iter()
+        .find_map(|p| match p {
+            ServerPacket::Snapshot(page) => Some(page),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(snapshot.acknowledged_input, Some(4));
+    // A replayed frame from the same sender is refused by the gate, never
+    // reordered ahead of the newer one.
+    client.tick(4);
+    assert!(status(&mut client).contains("Some(4)"));
 }

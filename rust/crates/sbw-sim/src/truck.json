@@ -1,10 +1,10 @@
 {
   "definition": "superbwarfare:truck",
   "item": "superbwarfare:truck",
-  "width": 2.4,
-  "length": 5.5,
-  "height": 2.3,
-  "seat_height": 1.2,
+  "width": 2.5,
+  "length": 8.8,
+  "height": 2.55,
+  "seat_height": 1.05,
   "acceleration": 0.023,
   "drag": 0.965,
   "max_speed": 0.45,
@@ -181,5 +181,5 @@
       "color": 4280427042
     }
   ],
-  "seat_z": 1.8
+  "seat_z": 3.1
 }

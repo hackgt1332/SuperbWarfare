@@ -1,10 +1,10 @@
 {
   "definition": "superbwarfare:sodayo_pick_up",
   "item": "superbwarfare:sodayo_pick_up",
-  "width": 2.0,
-  "length": 3.25,
-  "height": 1.6,
-  "seat_height": 0.85,
+  "width": 2.15,
+  "length": 4.7,
+  "height": 1.7,
+  "seat_height": 0.55,
   "acceleration": 0.035,
   "drag": 0.96,
   "max_speed": 0.65,
@@ -155,5 +155,5 @@
       "color": 4290506479
     }
   ],
-  "seat_z": 0.0
+  "seat_z": 0.55
 }

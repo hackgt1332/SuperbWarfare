@@ -1,0 +1,3 @@
+# Rust executable sources are not Java/IDE build output.
+!src/bin/
+!src/bin/*.rs

@@ -537,10 +537,10 @@ fn frozen_wire_v1_fixtures_preserve_discriminants_and_field_order() {
 fn vehicle_deployment_carries_only_a_valid_selected_slot() {
     let mut packet = input(1);
     packet.intent = Intent::DeployVehicle(8);
-    let bytes = wire::encode_client(&ClientPacket::Input(packet.clone())).unwrap();
+    let bytes = wire::encode_client(&ClientPacket::Input(packet)).unwrap();
     assert_eq!(
         wire::decode_client(&bytes).unwrap(),
-        ClientPacket::Input(packet.clone())
+        ClientPacket::Input(packet)
     );
     packet.intent = Intent::DeployVehicle(9);
     assert!(wire::encode_client(&ClientPacket::Input(packet)).is_err());

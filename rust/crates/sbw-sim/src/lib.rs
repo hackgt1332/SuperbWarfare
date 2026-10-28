@@ -3,6 +3,12 @@
 use sbw_contract::types::*;
 use serde::{Deserialize, Serialize};
 
+pub mod attachments;
+pub mod ballistics;
+pub mod catalog;
+pub mod vehicle_resources;
+pub mod vehicle_weapons;
+
 include!(concat!(env!("OUT_DIR"), "/content_hash.rs"));
 
 pub const AK47: &str = "superbwarfare:ak_47";

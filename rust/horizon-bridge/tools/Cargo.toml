@@ -1,16 +1,19 @@
 [package]
 name = "sbw-horizon-tools"
+default-run = "sbw-horizon-tools"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 horizon-mods.workspace = true
 sbw-contract.workspace = true
+sbw-sim.workspace = true
 
 [dev-dependencies]
-sbw-sim.workspace = true
+horizon-assets = { path = "../../../../horizon/crates/horizon-assets" }
 horizon-mods = { workspace = true, features = ["runtime"] }
 
 [lints]

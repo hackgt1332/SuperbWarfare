@@ -29,9 +29,25 @@ struct Server {
     bytes: usize,
     dirty: BTreeSet<String>,
     serial: u64,
-    cursor: String,
+    /// Rotation counters for the three bounded queues. They are positions in a
+    /// freshly ordered snapshot, not last-played keys: a key that disappears
+    /// and returns, or sorts before the previous one, can never be skipped
+    /// forever. They only ever advance, so no queue starves any sender.
+    snapshot_cursor: usize,
     simulation_cursor: usize,
-    request_cursor: String,
+    request_cursor: usize,
+}
+/// Rotate `items` left so the window of at most `budget` starts at `cursor`
+/// and advance `cursor` past the window that was served. The counter keeps its
+/// phase even when the list changes size; it is bounded by one pass.
+fn rotate<T>(items: &mut [T], cursor: &mut usize, budget: usize) {
+    if items.is_empty() {
+        *cursor = 0;
+        return;
+    }
+    let start = *cursor % items.len();
+    items.rotate_left(start);
+    *cursor = (start + budget.min(items.len())) % items.len();
 }
 fn send(player: &str, packet: ServerPacket) -> Result<(), String> {
     net::send(
@@ -44,6 +60,28 @@ fn reject(player: &str, sequence: Option<u64>, reason: RejectReason) {
         player,
         ServerPacket::Rejected(Rejection { sequence, reason }),
     );
+}
+/// Hotbar slots a deploy intent may name: exactly the nine a player selects
+/// with. Anything else is not a hotbar slot, whatever the client claims.
+const HOTBAR_SLOTS: u32 = 9;
+fn deployable(item: &str) -> bool {
+    sbw_sim::VEHICLES.contains(&item) && sbw_sim::vehicle_profile(item).is_some()
+}
+/// The hotbar slot the player is actually holding a deployable stack in.
+///
+/// A deploy is authorized only when the host reports exactly one selected
+/// stack, in a real hotbar slot, of exactly one unit, whose item is a
+/// deployable vehicle. Two selected stacks are an ambiguous inventory and
+/// deploy nothing; a split stack, an unselected one, a foreign item or a
+/// non-hotbar slot are all refusals. The client-named slot is checked against
+/// this value by the caller and never trusted on its own.
+fn held_vehicle(stacks: &[horizon_mod_sdk::server::gameplay::Stack]) -> Option<u32> {
+    let mut selected = stacks.iter().filter(|s| s.selected);
+    let first = selected.next()?;
+    if selected.next().is_some() {
+        return None;
+    }
+    (first.slot < HOTBAR_SLOTS && first.count == 1 && deployable(&first.item)).then_some(first.slot)
 }
 impl Server {
     fn receive(&mut self, player: &str, bytes: &[u8], tick: u64, received_session: net::Session) {
@@ -112,18 +150,27 @@ impl Server {
                         peer.controls.action(w.action, tick);
                     }
                     Intent::DeployVehicle(slot) => {
+                        // A deploy is authorized by the hotbar stack the server
+                        // sees as selected, never by the slot the client named.
+                        // A renamed or absent selection is a stale reference.
                         let inventories = gameplay::inventories();
-                        let stack = inventories
+                        let stacks = inventories
                             .iter()
                             .find(|p| p.player == player)
-                            .and_then(|p| {
-                                p.stacks.iter().find(|s| {
-                                    s.selected
-                                        && s.slot == u32::from(slot)
-                                        && sbw_sim::VEHICLES.contains(&s.item.as_str())
-                                })
-                            });
-                        let Some(s) = stack else {
+                            .map(|p| p.stacks.as_slice())
+                            .unwrap_or_default();
+                        let Some(held) = held_vehicle(stacks) else {
+                            reject(player, Some(input.sequence), RejectReason::StaleTarget);
+                            return;
+                        };
+                        // A request for another slot must not silently deploy
+                        // whichever stack happens to be held; that is not the
+                        // slot it asked for and the item it named is gone.
+                        if held != u32::from(slot) {
+                            reject(player, Some(input.sequence), RejectReason::StaleTarget);
+                            return;
+                        }
+                        let Some(s) = stacks.iter().find(|s| s.slot == held) else {
                             reject(player, Some(input.sequence), RejectReason::StaleTarget);
                             return;
                         };
@@ -150,11 +197,7 @@ impl Server {
     }
     fn simulate(&mut self, tick: u64) {
         let mut inventories = gameplay::inventories();
-        if !inventories.is_empty() {
-            let start = self.simulation_cursor % inventories.len();
-            inventories.rotate_left(start);
-            self.simulation_cursor = (start + 1) % inventories.len();
-        }
+        rotate(&mut inventories, &mut self.simulation_cursor, 1);
         for inventory in inventories {
             let Some(peer) = self.peers.get_mut(&inventory.player) else {
                 continue;
@@ -327,10 +370,10 @@ impl Server {
             );
         }
         let mut recipients: Vec<_> = self.dirty.iter().cloned().collect();
-        let split = recipients.partition_point(|p| p <= &self.cursor);
-        recipients.rotate_left(split);
+        rotate(&mut recipients, &mut self.snapshot_cursor, 4);
+        // The dirty set is a keyed set, so removing a served name below is
+        // stable even if a newer one was inserted during this same pass.
         for player in recipients.into_iter().take(4) {
-            self.cursor = player.clone();
             self.dirty.remove(&player);
             if let Some(peer) = self.peers.get_mut(&player) {
                 let dimension = dimensions.get(&player).map(String::as_str).unwrap_or("");
@@ -364,9 +407,9 @@ impl ServerMod for Server {
                 bytes: 0,
                 dirty: BTreeSet::new(),
                 serial: 0,
-                cursor: String::new(),
+                snapshot_cursor: 0,
                 simulation_cursor: 0,
-                request_cursor: String::new(),
+                request_cursor: 0,
             },
             Registration::new().on_tick().on_joins(),
         ))
@@ -391,27 +434,34 @@ impl ServerMod for Server {
         // Read current identity before consuming input: swapping items cannot
         // direct a delayed click at a newly selected weapon.
         self.simulate(tick);
+        // Drain senders in fair rotation. Each sender holds at most eight
+        // queued messages, so the newest packet for a given sender never sits
+        // behind more than this many of anyone else's turns.
         for _ in 0..4 {
-            let ids: BTreeSet<_> = self
-                .pending
-                .iter()
-                .filter_map(|m| m.player.clone())
-                .collect();
-            let player = ids
-                .iter()
-                .find(|id| **id > self.request_cursor)
-                .or_else(|| ids.first())
-                .cloned();
-            let Some(player) = player else {
-                break;
+            let ids: Vec<String> = {
+                let mut set = BTreeSet::new();
+                for m in &self.pending {
+                    if let Some(p) = &m.player {
+                        set.insert(p.clone());
+                    }
+                }
+                set.into_iter().collect()
             };
-            self.request_cursor = player.clone();
-            let index = self
+            let index = {
+                let len = ids.len();
+                if len == 0 {
+                    break;
+                }
+                self.request_cursor % len
+            };
+            let player = ids[index].clone();
+            self.request_cursor = (index + 1) % ids.len();
+            let position = self
                 .pending
                 .iter()
-                .position(|m| m.player.as_ref() == Some(&player))
+                .position(|m| m.player.as_deref() == Some(player.as_str()))
                 .expect("queued sender");
-            let message = self.pending.remove(index).expect("queued message");
+            let message = self.pending.remove(position).expect("queued message");
             self.bytes -= message.data.len();
             if let (Some(player), Some(session)) = (message.player, message.session) {
                 self.receive(&player, &message.data, tick, session);
@@ -425,6 +475,11 @@ impl ServerMod for Server {
         self.pending
             .retain(|m| m.player.as_deref() != Some(&player.id));
         self.bytes = self.pending.iter().map(|m| m.data.len()).sum();
+        // A departure renumbers the fair-queue rotations. Zeroing them here
+        // keeps the next pass starting at the front of the remaining senders
+        // instead of carrying an offset computed for a list that is now gone.
+        self.request_cursor = 0;
+        self.snapshot_cursor = 0;
     }
 }
 horizon_mod_sdk::export_server_mod!(Server);
